@@ -1,0 +1,6 @@
+# Let lines be longer before breaking
+max_width = 100
+
+# Be as permissive as possible about keeping short things on one line
+use_small_heuristics = "Max"
+

@@ -1,0 +1,14 @@
+[package]
+name = "evolve"
+version = "0.1.0"
+edition = "2024"
+authors = ["Elia Scotto (hello@scotto.me)"]
+
+[[bin]]
+name = "evolve"
+path = "src/main.rs"
+
+[dependencies]
+itertools = "0.14.0"
+logos = "0.15.1"
+rustyline = "17.0.2"
