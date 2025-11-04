@@ -4,3 +4,4 @@ pub mod core;
 pub mod repl;
 pub mod symbol;
 pub mod error;
+pub mod devtools;
