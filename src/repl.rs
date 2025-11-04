@@ -1,13 +1,22 @@
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::{error::ErrorWithSpan, reader};
+use crate::{error::ErrorWithSpan, reader, devtools};
 
-pub struct REPL {}
+pub struct REPL {
+    pub print_ast: bool,
+}
 
 impl REPL {
+    pub fn new(print_ast: bool) -> Self {
+        REPL { print_ast }
+    }
+
     pub fn rep(&self, input: &str) -> Result<String, ErrorWithSpan> {
         let ast = reader::read(input)?;
+        if self.print_ast {
+            println!("{}", devtools::pretty_print_ast(&ast));
+        }
         Ok(ast.to_string())
     }
 
