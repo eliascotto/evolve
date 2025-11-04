@@ -1,8 +1,36 @@
 use logos::Span;
 use std::fmt;
+use crate::reader::Source;
 
 //===----------------------------------------------------------------------===//
 // Error
+//===----------------------------------------------------------------------===//
+
+#[derive(Debug, Clone)]
+pub enum Error {
+    SyntaxError(SyntaxError),
+    RuntimeError(String),
+    TypeError(String),
+    ValueError(String),
+    IndexError(String),
+    KeyError(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::SyntaxError(e) => write!(f, "{}", e),
+            Error::RuntimeError(e) => write!(f, "Runtime error: {}", e),
+            Error::TypeError(e) => write!(f, "Type error: {}", e),
+            Error::ValueError(e) => write!(f, "Value error: {}", e),
+            Error::IndexError(e) => write!(f, "Index error: {}", e),
+            Error::KeyError(e) => write!(f, "Key error: {}", e),
+        }
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// SyntaxError
 //===----------------------------------------------------------------------===//
 
 #[derive(Debug, Clone)]
@@ -68,34 +96,16 @@ impl fmt::Display for SyntaxError {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Error {
-    SyntaxError(SyntaxError),
-    RuntimeError(String),
-    TypeError(String),
-    ValueError(String),
-    IndexError(String),
-    KeyError(String),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::SyntaxError(e) => write!(f, "{}", e),
-            Error::RuntimeError(e) => write!(f, "Runtime error: {}", e),
-            Error::TypeError(e) => write!(f, "Type error: {}", e),
-            Error::ValueError(e) => write!(f, "Value error: {}", e),
-            Error::IndexError(e) => write!(f, "Index error: {}", e),
-            Error::KeyError(e) => write!(f, "Key error: {}", e),
-        }
-    }
-}
+//===----------------------------------------------------------------------===//
+// ErrorWithSpan
+//===----------------------------------------------------------------------===//
 
 #[derive(Debug, Clone)]
 pub struct ErrorWithSpan {
     pub error: Error,
     pub span: Span,
     pub source: String, // Keep original source for context
+    pub source_location: Source,
 }
 
 impl ErrorWithSpan {
@@ -115,7 +125,8 @@ impl ErrorWithSpan {
         let underline = " ".repeat(column - 1) + &"^".repeat(self.span.len());
 
         format!(
-            "Error at line {}, column {}:\n{}\n{}\n{}",
+            "Error at ({} {}:{})\n{}\n{}\n{}",
+            self.source_location.display(),
             line_number,
             column,
             line_content,

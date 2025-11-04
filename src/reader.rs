@@ -1,5 +1,5 @@
 use logos::{Logos, Span};
-use std::fmt;
+use std::{fmt, fs, path};
 
 use crate::error::{Error, ErrorWithSpan, SyntaxError};
 use crate::list;
@@ -41,6 +41,24 @@ fn unescape_string(s: &str) -> String {
     }
 
     result
+}
+
+//===----------------------------------------------------------------------===//
+// Source
+//===----------------------------------------------------------------------===//
+#[derive(Debug, PartialEq, Clone)]
+pub enum Source {
+    File(path::PathBuf),
+    REPL,
+}
+
+impl Source {
+    pub fn display(&self) -> String {
+        match self {
+            Source::File(path) => path.display().to_string(),
+            Source::REPL => "REPL".to_string(),
+        }
+    }
 }
 
 //===----------------------------------------------------------------------===//
@@ -186,13 +204,15 @@ impl fmt::Display for Token {
 pub struct TokenAST {
     token: Token,
     span: Span,
+    source: Source,
 }
 
 #[derive(Debug)]
 pub struct Reader {
     tokens: Vec<TokenAST>,
-    source: String,
+    source_code: String,
     position: usize,
+    source_location: Source,
 }
 
 impl Reader {
@@ -204,7 +224,8 @@ impl Reader {
                 return Err(ErrorWithSpan {
                     error: Error::SyntaxError(SyntaxError::UnexpectedEOF { expected: None }),
                     span: self.last_span(),
-                    source: self.source.clone(),
+                    source: self.source_code.clone(),
+                    source_location: self.source_location.clone(),
                 });
             }
         };
@@ -220,7 +241,8 @@ impl Reader {
             None => Err(ErrorWithSpan {
                 error: Error::SyntaxError(SyntaxError::UnexpectedEOF { expected: None }),
                 span: self.last_span(),
-                source: self.source.clone(),
+                source: self.source_code.clone(),
+                source_location: self.source_location.clone(),
             }),
         }
     }
@@ -235,20 +257,24 @@ impl Reader {
 // Tokenizer
 //===----------------------------------------------------------------------===//
 
-pub fn tokenize(source: &str) -> Reader {
-    let mut lexer = Token::lexer(source.trim());
+pub fn tokenize(source_code: &str, source_location: Source) -> Reader {
+    let mut lexer = Token::lexer(source_code.trim());
     let mut tokens: Vec<TokenAST> = vec![];
 
     while let Some(token) = lexer.next() {
         if let Ok(token) = token {
             match token {
                 Token::Comment => continue,
-                _ => tokens.push(TokenAST { token, span: lexer.span() }),
+                _ => tokens.push(TokenAST {
+                    token,
+                    span: lexer.span(),
+                    source: source_location.clone(),
+                }),
             }
         }
     }
 
-    Reader { tokens, source: source.to_string(), position: 0 }
+    Reader { tokens, source_code: source_code.to_string(), position: 0, source_location }
 }
 
 //===----------------------------------------------------------------------===//
@@ -279,7 +305,8 @@ fn read_atom(reader: &mut Reader) -> Result<Value, ErrorWithSpan> {
                 expected: "atom".to_string(),
             }),
             span: token_ast.span.clone(),
-            source: reader.source.clone(),
+            source: reader.source_code.clone(),
+            source_location: reader.source_location.clone(),
         }),
     }
 }
@@ -311,7 +338,8 @@ fn read_sequence(reader: &mut Reader, coll_type: CollType) -> Result<Value, Erro
                         position: open_span.start,
                     }),
                     span: open_span.clone(),
-                    source: reader.source.clone(),
+                    source: reader.source_code.clone(),
+                    source_location: reader.source_location.clone(),
                 });
             }
         };
@@ -380,7 +408,8 @@ fn read_form(reader: &mut Reader) -> Result<Value, ErrorWithSpan> {
                             expected: "set".to_string(),
                         }),
                         span: next_token_ast.span.clone(),
-                        source: reader.source.clone(),
+                        source: reader.source_code.clone(),
+                        source_location: reader.source_location.clone(),
                     });
                 }
             }
@@ -394,8 +423,19 @@ fn read_form(reader: &mut Reader) -> Result<Value, ErrorWithSpan> {
     }
 }
 
+pub fn read_file(path: &path::Path) -> Result<Value, ErrorWithSpan> {
+    let source_code = fs::read_to_string(path).map_err(|e| ErrorWithSpan {
+        error: Error::RuntimeError(format!("Failed to read file: {}", e)),
+        span: logos::Span { start: 0, end: 0 },
+        source: String::new(),
+        source_location: Source::File(path.to_path_buf()),
+    })?;
+    let mut reader = tokenize(&source_code, Source::File(path.to_path_buf()));
+    read_form(&mut reader)
+}
+
 pub fn read(source: &str) -> Result<Value, ErrorWithSpan> {
-    let mut reader = tokenize(source);
+    let mut reader = tokenize(source, Source::REPL);
     read_form(&mut reader)
 }
 
@@ -408,80 +448,111 @@ mod tests {
         let src: &str = r#"(def x 123 -45.6 "hi\n\"there\"" ; comment
                       ~@ [a b] {k v} 'sym `q ^m @n #t _ ~ sym-1 \a)"#;
 
-        let toks: Vec<TokenAST> = tokenize(src).tokens;
+        let toks: Vec<TokenAST> = tokenize(src, Source::REPL).tokens;
 
         // Smoke-check presence/order of a few key tokens:
-        assert!(
-            toks.starts_with(&[TokenAST { token: Token::LParen, span: Span { start: 0, end: 1 } }])
-        );
-        assert!(
-            toks.contains(&TokenAST { token: Token::Int(123), span: Span { start: 1, end: 4 } })
-        );
-        assert!(
-            toks.contains(&TokenAST {
-                token: Token::Float(-45.6),
-                span: Span { start: 5, end: 10 }
-            })
-        );
+        assert!(toks.starts_with(&[TokenAST {
+            token: Token::LParen,
+            span: Span { start: 0, end: 1 },
+            source: Source::REPL,
+        }]));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Int(123),
+            span: Span { start: 1, end: 4 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Float(-45.6),
+            span: Span { start: 5, end: 10 },
+            source: Source::REPL,
+        }));
         assert!(toks.contains(&TokenAST {
             token: Token::Str("hi\n\"there\"".to_string()),
-            span: Span { start: 11, end: 26 }
+            span: Span { start: 11, end: 26 },
+            source: Source::REPL,
         }));
-        assert!(
-            toks.contains(&TokenAST { token: Token::TildeAt, span: Span { start: 27, end: 29 } })
-        );
-        assert!(
-            toks.contains(&TokenAST { token: Token::LBracket, span: Span { start: 30, end: 32 } })
-        );
-        assert!(
-            toks.contains(&TokenAST { token: Token::LBrace, span: Span { start: 33, end: 35 } })
-        );
-        assert!(
-            toks.contains(&TokenAST { token: Token::Quote, span: Span { start: 36, end: 38 } })
-        );
-        assert!(
-            toks.contains(&TokenAST { token: Token::Backtick, span: Span { start: 39, end: 41 } })
-        );
-        assert!(
-            toks.contains(&TokenAST { token: Token::Caret, span: Span { start: 42, end: 44 } })
-        );
-        assert!(toks.contains(&TokenAST { token: Token::At, span: Span { start: 45, end: 47 } }));
-        assert!(toks.contains(&TokenAST { token: Token::Hash, span: Span { start: 48, end: 50 } }));
-        assert!(
-            toks.contains(&TokenAST {
-                token: Token::Underscore,
-                span: Span { start: 51, end: 53 }
-            })
-        );
-        assert!(
-            toks.contains(&TokenAST { token: Token::Tilde, span: Span { start: 54, end: 56 } })
-        );
+        assert!(toks.contains(&TokenAST {
+            token: Token::TildeAt,
+            span: Span { start: 27, end: 29 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::LBracket,
+            span: Span { start: 30, end: 32 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::LBrace,
+            span: Span { start: 33, end: 35 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Quote,
+            span: Span { start: 36, end: 38 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Backtick,
+            span: Span { start: 39, end: 41 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Caret,
+            span: Span { start: 42, end: 44 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::At,
+            span: Span { start: 45, end: 47 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Hash,
+            span: Span { start: 48, end: 50 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Underscore,
+            span: Span { start: 51, end: 53 },
+            source: Source::REPL,
+        }));
+        assert!(toks.contains(&TokenAST {
+            token: Token::Tilde,
+            span: Span { start: 54, end: 56 },
+            source: Source::REPL,
+        }));
         assert!(toks.contains(&TokenAST {
             token: Token::Symbol("sym-1".to_string()),
-            span: Span { start: 57, end: 62 }
+            span: Span { start: 57, end: 62 },
+            source: Source::REPL,
         }));
         assert!(toks.contains(&TokenAST {
             token: Token::Symbol("sym".to_string()),
-            span: Span { start: 63, end: 66 }
+            span: Span { start: 63, end: 66 },
+            source: Source::REPL,
         }));
         assert!(toks.contains(&TokenAST {
             token: Token::Symbol("\\a".to_string()),
-            span: Span { start: 67, end: 69 }
+            span: Span { start: 67, end: 69 },
+            source: Source::REPL,
         }));
-        assert!(
-            toks.contains(&TokenAST { token: Token::RParen, span: Span { start: 70, end: 71 } })
-        );
+        assert!(toks.contains(&TokenAST {
+            token: Token::RParen,
+            span: Span { start: 70, end: 71 },
+            source: Source::REPL,
+        }));
     }
 
     #[test]
     fn unterminated_string_is_flagged() {
         let src = r#""oops"#;
-        let v: Vec<_> = tokenize(src).tokens;
+        let v: Vec<_> = tokenize(src, Source::REPL).tokens;
         assert_eq!(
             v,
             vec![TokenAST {
                 token: Token::UnterminatedStr("\"oops".to_string()),
-                span: Span { start: 0, end: 5 }
+                span: Span { start: 0, end: 5 },
+                source: Source::REPL,
             }]
         );
     }
