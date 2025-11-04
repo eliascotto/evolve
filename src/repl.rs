@@ -1,10 +1,9 @@
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
-use crate::{reader, error::{ErrorWithSpan}};
+use crate::{error::ErrorWithSpan, reader};
 
-pub struct REPL {
-}
+pub struct REPL {}
 
 impl REPL {
     pub fn rep(&self, input: &str) -> Result<String, ErrorWithSpan> {
@@ -14,7 +13,7 @@ impl REPL {
 
     pub fn run(&self) {
         let mut rl = DefaultEditor::new().unwrap();
-        if rl.load_history("history").is_err() {}
+        if rl.load_history(".evolve-history").is_err() {}
 
         'repl_loop: loop {
             let readline = rl.readline(&format!("> "));
@@ -24,7 +23,7 @@ impl REPL {
                         eprintln!("Error adding to history: {:?}", err);
                     }
 
-                    if let Err(err) = rl.save_history("history") {
+                    if let Err(err) = rl.save_history(".evolve-history") {
                         eprintln!("Error saving history: {:?}", err);
                     }
 
