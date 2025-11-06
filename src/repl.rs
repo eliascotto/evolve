@@ -1,7 +1,7 @@
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::{error::ErrorWithSpan, reader, devtools};
+use crate::{error::Diagnostic, reader, devtools};
 
 pub struct REPL {
     pub print_ast: bool,
@@ -12,7 +12,7 @@ impl REPL {
         REPL { print_ast }
     }
 
-    pub fn rep(&self, input: &str) -> Result<String, ErrorWithSpan> {
+    pub fn rep(&self, input: &str) -> Result<String, Diagnostic> {
         let ast = reader::read(input)?;
         if self.print_ast {
             println!("{}", devtools::pretty_print_ast(&ast));
@@ -40,7 +40,7 @@ impl REPL {
                         match self.rep(&line) {
                             Ok(out) => println!("{}", out),
                             Err(e) => {
-                                println!("{}", e.format_error());
+                                println!("{}", e.format());
                                 continue 'repl_loop;
                             }
                         }

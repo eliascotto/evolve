@@ -1,48 +1,74 @@
+use logos::Span;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::error::{Error, SyntaxError};
+use crate::interner::{self, KwId, NsId, SymId};
+
+//===----------------------------------------------------------------------===//
+// AST
+//===----------------------------------------------------------------------===//
+
 #[derive(Debug, Clone)]
 pub enum Value {
-    Nil,
-    Bool(bool),
+    Nil { span: Span },
+    Bool { span: Span, value: bool },
 
-    Char(char),
-    Int(i64),
-    Float(f64),
+    Char { span: Span, value: char },
+    Int { span: Span, value: i64 },
+    Float { span: Span, value: f64 },
 
-    String(String),
+    String { span: Span, value: String },
 
-    Symbol(String),
-    // Keywords are used to identify specific values in a collection
-    // They are NOT case-sensitive
-    Keyword(String),
+    Symbol { span: Span, value: SymId, meta: Option<BTreeMap<KwId, Value>> },
+    Keyword { span: Span, value: KwId },
 
     // Collections
-    List(Vec<Value>),
-    Vector(Vec<Value>),
-    Map(BTreeMap<Value, Value>),
-    Set(BTreeSet<Value>),
+    List { span: Span, value: Vec<Value>, meta: Option<BTreeMap<KwId, Value>> },
+    Vector { span: Span, value: Vec<Value>, meta: Option<BTreeMap<KwId, Value>> },
+    Map { span: Span, value: BTreeMap<Value, Value>, meta: Option<BTreeMap<KwId, Value>> },
+    Set { span: Span, value: BTreeSet<Value>, meta: Option<BTreeMap<KwId, Value>> },
+
+    Namespace { span: Span, value: NsId },
+
+    // Internal
+    SpecialForm { span: Span },
 }
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Char(a), Value::Char(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => {
+            (Value::Nil { span: _ }, Value::Nil { span: _ }) => true,
+            (Value::Bool { span: _, value: a }, Value::Bool { span: _, value: b }) => a == b,
+            (Value::Char { span: _, value: a }, Value::Char { span: _, value: b }) => a == b,
+            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => a == b,
+            (Value::Float { span: _, value: a }, Value::Float { span: _, value: b }) => {
                 // Handle NaN comparison
                 if a.is_nan() && b.is_nan() { true } else { a == b }
             }
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Symbol(a), Value::Symbol(b)) => a == b,
-            (Value::Keyword(a), Value::Keyword(b)) => a == b,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::Vector(a), Value::Vector(b)) => a == b,
-            (Value::Map(a), Value::Map(b)) => a == b,
-            (Value::Set(a), Value::Set(b)) => a == b,
+            (Value::String { span: _, value: a }, Value::String { span: _, value: b }) => a == b,
+            (
+                Value::Symbol { span: _, value: a, meta: _ },
+                Value::Symbol { span: _, value: b, meta: _ },
+            ) => a == b,
+            (Value::Keyword { span: _, value: a }, Value::Keyword { span: _, value: b }) => a == b,
+            (
+                Value::List { span: _, value: a, meta: _ },
+                Value::List { span: _, value: b, meta: _ },
+            ) => a == b,
+            (
+                Value::Vector { span: _, value: a, meta: _ },
+                Value::Vector { span: _, value: b, meta: _ },
+            ) => a == b,
+            (
+                Value::Map { span: _, value: a, meta: _ },
+                Value::Map { span: _, value: b, meta: _ },
+            ) => a == b,
+            (
+                Value::Set { span: _, value: a, meta: _ },
+                Value::Set { span: _, value: b, meta: _ },
+            ) => a == b,
             _ => false,
         }
     }
@@ -59,11 +85,11 @@ impl PartialOrd for Value {
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Value::Nil, Value::Nil) => Ordering::Equal,
-            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            (Value::Char(a), Value::Char(b)) => a.cmp(b),
-            (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => {
+            (Value::Nil { span: _ }, Value::Nil { span: _ }) => Ordering::Equal,
+            (Value::Bool { span: _, value: a }, Value::Bool { span: _, value: b }) => a.cmp(b),
+            (Value::Char { span: _, value: a }, Value::Char { span: _, value: b }) => a.cmp(b),
+            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => a.cmp(b),
+            (Value::Float { span: _, value: a }, Value::Float { span: _, value: b }) => {
                 // Handle NaN comparison - NaN is considered less than any other value
                 if a.is_nan() && b.is_nan() {
                     Ordering::Equal
@@ -75,30 +101,36 @@ impl Ord for Value {
                     a.partial_cmp(b).unwrap_or(Ordering::Equal)
                 }
             }
-            (Value::String(a), Value::String(b)) => a.cmp(b),
-            (Value::Symbol(a), Value::Symbol(b)) => a.cmp(b),
-            (Value::Keyword(a), Value::Keyword(b)) => a.cmp(b),
-            (Value::List(a), Value::List(b)) => a.cmp(b),
-            (Value::Vector(a), Value::Vector(b)) => a.cmp(b),
-            (Value::Map(a), Value::Map(b)) => a.cmp(b),
-            (Value::Set(a), Value::Set(b)) => a.cmp(b),
-            // Different types are ordered by their discriminant
-            (a, b) => {
-                let a_disc = std::mem::discriminant(a);
-                let b_disc = std::mem::discriminant(b);
-                if a_disc == b_disc {
-                    Ordering::Equal
-                } else {
-                    // Use a simple ordering based on discriminant values
-                    // This provides a consistent ordering for different types
-                    format!("{:?}", a_disc).cmp(&format!("{:?}", b_disc))
-                }
+            (Value::String { span: _, value: a }, Value::String { span: _, value: b }) => a.cmp(b),
+            (
+                Value::Symbol { span: _, value: a, meta: _ },
+                Value::Symbol { span: _, value: b, meta: _ },
+            ) => a.0.cmp(&b.0),
+            (Value::Keyword { span: _, value: a }, Value::Keyword { span: _, value: b }) => {
+                a.0.cmp(&b.0)
             }
+            (
+                Value::List { span: _, value: a, meta: _ },
+                Value::List { span: _, value: b, meta: _ },
+            ) => a.cmp(b),
+            (
+                Value::Vector { span: _, value: a, meta: _ },
+                Value::Vector { span: _, value: b, meta: _ },
+            ) => a.cmp(b),
+            (
+                Value::Map { span: _, value: a, meta: _ },
+                Value::Map { span: _, value: b, meta: _ },
+            ) => a.cmp(b),
+            (
+                Value::Set { span: _, value: a, meta: _ },
+                Value::Set { span: _, value: b, meta: _ },
+            ) => a.cmp(b),
+            _ => Ordering::Equal,
         }
     }
 }
 
-pub fn pr_seq(seq: &Vec<Value>, start: &str, end: &str, join: &str) -> String {
+pub fn pr_seq(seq: &[Value], start: &str, end: &str, join: &str) -> String {
     let strs: Vec<String> = seq.iter().map(|x| x.to_string()).collect();
     format!("{}{}{}", start, strs.join(join), end)
 }
@@ -106,42 +138,140 @@ pub fn pr_seq(seq: &Vec<Value>, start: &str, end: &str, join: &str) -> String {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let s = match self {
-            Value::Nil => String::from("nil"),
-            Value::Bool(val) => val.to_string(),
-            Value::Int(val) => format!("{}", val),
-            Value::Float(val) => format!("{}", val),
-            Value::Char(c) => format!("\\{}", c),
-            Value::String(s) => s.clone(),
-            Value::Symbol(sym) => sym.to_string(),
-            Value::Keyword(kw) => kw.to_string(),
-            Value::List(l) => pr_seq(&l, "(", ")", " "),
-            Value::Vector(v) => pr_seq(&v, "[", "]", " "),
-            Value::Map(hm) => {
-                let l = hm.iter().flat_map(|(k, v)| vec![k.clone(), v.clone()]).collect();
-                pr_seq(&l, "{", "}", " ")
+            Value::Nil { span: _ } => String::from("nil"),
+            Value::Bool { span: _, value: val } => val.to_string(),
+            Value::Int { span: _, value: val } => format!("{}", val),
+            Value::Float { span: _, value: val } => format!("{}", val),
+            Value::Char { span: _, value: c } => format!("\\{}", c),
+            Value::String { span: _, value: s } => s.clone(),
+            Value::Symbol { span: _, value: sym, meta: _ } => interner::sym_to_str(*sym),
+            Value::Keyword { span: _, value: kw } => interner::kw_print(*kw),
+            Value::List { span: _, value: l, meta: _ } => pr_seq(&l, "(", ")", " "),
+            Value::Vector { span: _, value: v, meta: _ } => pr_seq(&v, "[", "]", " "),
+            Value::Map { span: _, value: hm, meta: _ } => {
+                let seq: Vec<Value> = hm.iter().flat_map(|(k, v)| [k.clone(), v.clone()]).collect();
+                pr_seq(&seq, "{", "}", " ")
             }
-            Value::Set(set) => {
-                let strs: Vec<String> = set.iter().map(|x| x.to_string()).collect();
-                format!("{{{}}}", strs.join(" "))
-            } // Value::Func(f, _) => format!("#<fn {:?}>", f),
-              // Value::Macro(f, _) => format!("#<macro {:?}>", f),
-              // Value::Lambda { ast, params, .. } => {
-              //     let mut overloads = vec![];
-              //     for idx in 0..params.len() {
-              //         overloads.push(format!(
-              //             "({} {})",
-              //             params[idx].to_string(),
-              //             ast[idx].to_string()
-              //         ))
-              //     }
-              //     format!("(fn {})", overloads.join("\n"))
-              // }
-              // Value::Namespace(ns) => ns.borrow().to_string(),
-              // Value::Atom(a) => format!("#atom {{:val {}}}", a.borrow().to_string()),
-              // Value::Error(err) => format_error(err.clone()),
-              // Value::Recur(l) => format!("#<recur {:?}>", l),
+            Value::Set { span: _, value: set, meta: _ } => {
+                let seq: Vec<Value> = set.iter().cloned().collect();
+                pr_seq(&seq, "{", "}", " ")
+            }
+            Value::Namespace { span: _, value: ns } => interner::ns_to_str(*ns),
+            Value::SpecialForm { span: _ } => String::from("#<special-form>"),
         };
         write!(f, "{}", s)
+    }
+}
+
+impl Value {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Value::Nil { span: _ } => "Nil",
+            Value::Bool { span: _, value: _ } => "Bool",
+            Value::Int { span: _, value: _ } => "Int",
+            Value::Float { span: _, value: _ } => "Float",
+            Value::Char { span: _, value: _ } => "Char",
+            Value::String { span: _, value: _ } => "String",
+            Value::Symbol { span: _, value: _, meta: _ } => "Symbol",
+            Value::Keyword { span: _, value: _ } => "Keyword",
+            Value::List { span: _, value: _, meta: _ } => "List",
+            Value::Vector { span: _, value: _, meta: _ } => "Vector",
+            Value::Map { span: _, value: _, meta: _ } => "Map",
+            Value::Set { span: _, value: _, meta: _ } => "Set",
+            Value::Namespace { span: _, value: _ } => "Namespace",
+            Value::SpecialForm { span: _ } => "SpecialForm",
+        }
+    }
+
+    pub fn get_meta(&self) -> Option<BTreeMap<KwId, Value>> {
+        match self {
+            Value::Symbol { meta, .. }
+            | Value::List { meta, .. }
+            | Value::Vector { meta, .. }
+            | Value::Map { meta, .. }
+            | Value::Set { meta, .. } => meta.clone(),
+            _ => None,
+        }
+    }
+
+    pub fn set_meta(&self, meta_def: Value) -> Result<Value, Error> {
+        // Check if this type supports metadata
+        let mut meta_map = match self {
+            Value::Symbol { meta, .. }
+            | Value::List { meta, .. }
+            | Value::Vector { meta, .. }
+            | Value::Map { meta, .. }
+            | Value::Set { meta, .. } => meta.clone().unwrap_or_else(BTreeMap::new),
+            _ => {
+                return Err(Error::SyntaxError(SyntaxError::InvalidMeta {
+                    reason: format!("Metadata cannot be applied to {}", self.to_string()),
+                }));
+            }
+        };
+
+        // Handle meta_def: either a Keyword or a Map
+        match meta_def {
+            Value::Keyword { span: _, value: kw } => {
+                // If meta_def is a Keyword, set its value to true
+                meta_map
+                    .insert(kw, Value::Bool { span: Span { start: 0, end: 0 }, value: true });
+            }
+            Value::Map { span: _, value: hm, meta: _ } => {
+                // If meta_def is a Map, only Keyword values are allowed as keys
+                for (k, v) in hm.iter() {
+                    if let Value::Keyword { value: kw, span: _ } = k {
+                        meta_map.insert(*kw, v.clone());
+                    } else {
+                        return Err(Error::SyntaxError(SyntaxError::InvalidMeta {
+                            reason: format!(
+                                "Metadata map key must be a keyword, got {}",
+                                k.to_string()
+                            ),
+                        }));
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::SyntaxError(SyntaxError::InvalidMeta {
+                    reason: format!(
+                        "Metadata must be a keyword or a map, got {}",
+                        meta_def.to_string()
+                    ),
+                }));
+            }
+        }
+
+        // Create a new Value with the updated metadata
+        let result = match self {
+            Value::Symbol { span, value, .. } => Value::Symbol {
+                span: span.clone(),
+                value: *value,
+                meta: Some(meta_map),
+            },
+            Value::List { span, value, .. } => Value::List {
+                span: span.clone(),
+                value: value.clone(),
+                meta: Some(meta_map),
+            },
+            Value::Vector { span, value, .. } => Value::Vector {
+                span: span.clone(),
+                value: value.clone(),
+                meta: Some(meta_map),
+            },
+            Value::Map { span, value, .. } => Value::Map {
+                span: span.clone(),
+                value: value.clone(),
+                meta: Some(meta_map),
+            },
+            Value::Set { span, value, .. } => Value::Set {
+                span: span.clone(),
+                value: value.clone(),
+                meta: Some(meta_map),
+            },
+            _ => unreachable!(),
+        };
+
+        Ok(result)
     }
 }
 
@@ -175,39 +305,583 @@ pub fn create_btree_set_from_sequence(seq: Vec<Value>) -> BTreeSet<Value> {
 }
 
 //===----------------------------------------------------------------------===//
-// Macros
+// Tests
 //===----------------------------------------------------------------------===//
 
-#[macro_export]
-macro_rules! list {
-    () => (
-        Value::List(vec![])
-    );
-    ($($args:expr),*) => {{
-        let v: Vec<Value> = vec![$($args),*];
-        Value::List(v)
-    }};
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interner;
+    use std::collections::BTreeMap;
 
-#[macro_export]
-macro_rules! vector {
-    () => (
-        Value::Vector(vec![])
-    );
-    ($($args:expr),*) => {{
-        let v: Vec<Value> = vec![$($args),*];
-        Value::Vector(v)
-    }};
-}
+    fn test_span() -> Span {
+        Span { start: 0, end: 0 }
+    }
 
-#[macro_export]
-macro_rules! set {
-    () => {
-        Value::Set(BTreeSet::new())
-    };
-    ($($args:expr),*) => {{
-        let s: BTreeSet<Value> = BTreeSet::from([$($args),*]);
-        Value::Set(s)
-    }};
-}
+    // Helper function to create a keyword value
+    fn kw(s: &str) -> Value {
+        Value::Keyword { span: test_span(), value: interner::intern_kw(s) }
+    }
 
+    // Helper function to create a symbol value
+    fn sym(s: &str) -> Value {
+        Value::Symbol { span: test_span(), value: interner::intern_sym(s), meta: None }
+    }
+
+    // Helper function to create a symbol with metadata
+    fn sym_with_meta(s: &str, meta: Option<BTreeMap<KwId, Value>>) -> Value {
+        Value::Symbol { span: test_span(), value: interner::intern_sym(s), meta }
+    }
+
+    // Helper function to create an empty list
+    fn empty_list() -> Value {
+        Value::List { span: test_span(), value: vec![], meta: None }
+    }
+
+    // Helper function to create a list with metadata
+    fn list_with_meta(v: Vec<Value>, meta: Option<BTreeMap<KwId, Value>>) -> Value {
+        Value::List { span: test_span(), value: v, meta }
+    }
+
+    // Helper function to create an empty map
+    fn empty_map() -> Value {
+        Value::Map { span: test_span(), value: BTreeMap::new(), meta: None }
+    }
+
+    // Helper function to create a map with metadata
+    fn map_with_meta(m: BTreeMap<Value, Value>, meta: Option<BTreeMap<KwId, Value>>) -> Value {
+        Value::Map { span: test_span(), value: m, meta }
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Metadata Tests
+    //===----------------------------------------------------------------------===//
+
+    #[test]
+    fn test_get_meta_supported_types() {
+        // Types that support metadata should return Some or None
+        let mut meta_map = BTreeMap::new();
+        meta_map.insert(interner::intern_kw("test"), Value::Bool { span: test_span(), value: true });
+
+        let sym_with = sym_with_meta("test", Some(meta_map.clone()));
+        let sym_without = sym("test");
+
+        assert!(sym_with.get_meta().is_some());
+        assert!(sym_without.get_meta().is_none());
+
+        let list_with = list_with_meta(vec![], Some(meta_map.clone()));
+        let list_without = empty_list();
+
+        assert!(list_with.get_meta().is_some());
+        assert!(list_without.get_meta().is_none());
+    }
+
+    #[test]
+    fn test_get_meta_unsupported_types() {
+        // Types that don't support metadata should return None
+        let nil = Value::Nil { span: test_span() };
+        let bool_val = Value::Bool { span: test_span(), value: true };
+        let int_val = Value::Int { span: test_span(), value: 42 };
+        let float_val = Value::Float { span: test_span(), value: 3.14 };
+        let char_val = Value::Char { span: test_span(), value: 'a' };
+        let string_val = Value::String { span: test_span(), value: "test".to_string() };
+        let keyword_val = kw("test");
+        let namespace_val = Value::Namespace { span: test_span(), value: interner::intern_ns("test") };
+        let special_form = Value::SpecialForm { span: test_span() };
+
+        assert!(nil.get_meta().is_none());
+        assert!(bool_val.get_meta().is_none());
+        assert!(int_val.get_meta().is_none());
+        assert!(float_val.get_meta().is_none());
+        assert!(char_val.get_meta().is_none());
+        assert!(string_val.get_meta().is_none());
+        assert!(keyword_val.get_meta().is_none());
+        assert!(namespace_val.get_meta().is_none());
+        assert!(special_form.get_meta().is_none());
+    }
+
+    #[test]
+    fn test_set_meta_unsupported_types() {
+        // Setting metadata on unsupported types should return an error
+        let nil = Value::Nil { span: test_span() };
+        let bool_val = Value::Bool { span: test_span(), value: true };
+        let int_val = Value::Int { span: test_span(), value: 42 };
+        let keyword_val = kw("test");
+
+        assert!(nil.set_meta(keyword_val.clone()).is_err());
+        assert!(bool_val.set_meta(keyword_val.clone()).is_err());
+        assert!(int_val.set_meta(keyword_val.clone()).is_err());
+    }
+
+    #[test]
+    fn test_set_meta_with_keyword() {
+        // Setting metadata with a keyword should set it to true
+        let sym = sym("test-symbol");
+        let meta_kw = kw("deprecated");
+
+        let result = sym.set_meta(meta_kw).unwrap();
+        let meta = result.get_meta().unwrap();
+
+        assert_eq!(meta.len(), 1);
+        assert!(meta.contains_key(&interner::intern_kw("deprecated")));
+        match meta.get(&interner::intern_kw("deprecated")) {
+            Some(Value::Bool { value: true, .. }) => {}
+            _ => panic!("Expected boolean true value"),
+        }
+    }
+
+    #[test]
+    fn test_set_meta_with_map() {
+        // Setting metadata with a map should merge the values
+        let sym = sym("test-symbol");
+        let mut meta_map = BTreeMap::new();
+        meta_map.insert(kw("key1"), Value::Int { span: test_span(), value: 42 });
+        meta_map.insert(kw("key2"), Value::String { span: test_span(), value: "value".to_string() });
+        let meta_value = Value::Map { span: test_span(), value: meta_map, meta: None };
+
+        let result = sym.set_meta(meta_value).unwrap();
+        let meta = result.get_meta().unwrap();
+
+        assert_eq!(meta.len(), 2);
+    }
+
+    #[test]
+    fn test_set_meta_with_invalid_type() {
+        // Setting metadata with invalid type should return an error
+        let sym = sym("test-symbol");
+        let invalid_meta = Value::Int { span: test_span(), value: 42 };
+        let invalid_meta2 = Value::String { span: test_span(), value: "invalid".to_string() };
+
+        assert!(sym.set_meta(invalid_meta).is_err());
+        assert!(sym.set_meta(invalid_meta2).is_err());
+    }
+
+    #[test]
+    fn test_set_meta_with_non_keyword_map_keys() {
+        // Setting metadata with a map that has non-keyword keys should return an error
+        let sym = sym("test-symbol");
+        let mut meta_map = BTreeMap::new();
+        meta_map.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 42 });
+        let meta_value = Value::Map { span: test_span(), value: meta_map, meta: None };
+
+        assert!(sym.set_meta(meta_value).is_err());
+    }
+
+    #[test]
+    fn test_set_meta_merges_existing() {
+        // Setting metadata should merge with existing metadata
+        let mut existing_meta = BTreeMap::new();
+        existing_meta.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
+        let sym = sym_with_meta("test", Some(existing_meta));
+
+        let mut new_meta_map = BTreeMap::new();
+        new_meta_map.insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
+        let new_meta = Value::Map { span: test_span(), value: new_meta_map, meta: None };
+
+        let result = sym.set_meta(new_meta).unwrap();
+        let meta = result.get_meta().unwrap();
+
+        assert_eq!(meta.len(), 2);
+        assert!(meta.contains_key(&interner::intern_kw("key1")));
+        assert!(meta.contains_key(&interner::intern_kw("key2")));
+    }
+
+    #[test]
+    fn test_set_meta_overwrites_existing_key() {
+        // Setting metadata should overwrite existing keys
+        let mut existing_meta = BTreeMap::new();
+        existing_meta.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
+        let sym = sym_with_meta("test", Some(existing_meta));
+
+        let mut new_meta_map = BTreeMap::new();
+        new_meta_map.insert(kw("key1"), Value::String { span: test_span(), value: "new".to_string() });
+        let new_meta = Value::Map { span: test_span(), value: new_meta_map, meta: None };
+
+        let result = sym.set_meta(new_meta).unwrap();
+        let meta = result.get_meta().unwrap();
+
+        assert_eq!(meta.len(), 1);
+        match meta.get(&interner::intern_kw("key1")) {
+            Some(Value::String { value: v, .. }) => assert_eq!(v, "new"),
+            _ => panic!("Expected string value"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_preserved_on_clone() {
+        // Metadata should be preserved when cloning
+        let mut meta_map = BTreeMap::new();
+        meta_map.insert(interner::intern_kw("test"), Value::Bool { span: test_span(), value: true });
+        let sym = sym_with_meta("test", Some(meta_map));
+
+        let cloned = sym.clone();
+        assert_eq!(sym.get_meta(), cloned.get_meta());
+    }
+
+    #[test]
+    fn test_metadata_all_collection_types() {
+        // All collection types should support metadata
+        let meta_kw = kw("test");
+
+        let list = empty_list();
+        let vector = Value::Vector { span: test_span(), value: vec![], meta: None };
+        let map = empty_map();
+        let set = Value::Set { span: test_span(), value: BTreeSet::new(), meta: None };
+
+        assert!(list.set_meta(meta_kw.clone()).is_ok());
+        assert!(vector.set_meta(meta_kw.clone()).is_ok());
+        assert!(map.set_meta(meta_kw.clone()).is_ok());
+        assert!(set.set_meta(meta_kw).is_ok());
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Comparison Tests
+    //===----------------------------------------------------------------------===//
+
+    #[test]
+    fn test_equality_ignores_metadata() {
+        // Two values with same content but different metadata should be equal
+        let sym1 = sym("test");
+        let mut meta1 = BTreeMap::new();
+        meta1.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
+        let sym1_with_meta = sym_with_meta("test", Some(meta1));
+
+        let mut meta2 = BTreeMap::new();
+        meta2.insert(interner::intern_kw("key2"), Value::Int { span: test_span(), value: 2 });
+        let sym2_with_meta = sym_with_meta("test", Some(meta2));
+
+        assert_eq!(sym1, sym1_with_meta);
+        assert_eq!(sym1_with_meta, sym2_with_meta);
+    }
+
+    #[test]
+    fn test_equality_different_types() {
+        // Different types should not be equal
+        let int_val = Value::Int { span: test_span(), value: 42 };
+        let float_val = Value::Float { span: test_span(), value: 42.0 };
+        let string_val = Value::String { span: test_span(), value: "42".to_string() };
+
+        assert_ne!(int_val, float_val);
+        assert_ne!(int_val, string_val);
+        assert_ne!(float_val, string_val);
+    }
+
+    #[test]
+    fn test_equality_nan() {
+        // NaN values should be equal to each other
+        let nan1 = Value::Float { span: test_span(), value: f64::NAN };
+        let nan2 = Value::Float { span: test_span(), value: f64::NAN };
+
+        assert_eq!(nan1, nan2);
+    }
+
+    #[test]
+    fn test_equality_nan_vs_number() {
+        // NaN should not be equal to any number
+        let nan = Value::Float { span: test_span(), value: f64::NAN };
+        let num = Value::Float { span: test_span(), value: 42.0 };
+
+        assert_ne!(nan, num);
+    }
+
+    #[test]
+    fn test_ordering_nan() {
+        // NaN should be considered less than any other value
+        let nan = Value::Float { span: test_span(), value: f64::NAN };
+        let num = Value::Float { span: test_span(), value: 42.0 };
+        let neg_inf = Value::Float { span: test_span(), value: f64::NEG_INFINITY };
+
+        assert!(nan < num);
+        assert!(nan < neg_inf);
+        assert_eq!(nan.partial_cmp(&nan), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_ordering_different_types() {
+        // Different types should compare as Equal (for ordering purposes)
+        let int_val = Value::Int { span: test_span(), value: 42 };
+        let float_val = Value::Float { span: test_span(), value: 42.0 };
+        let string_val = Value::String { span: test_span(), value: "42".to_string() };
+
+        assert_eq!(int_val.cmp(&float_val), Ordering::Equal);
+        assert_eq!(int_val.cmp(&string_val), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_nil() {
+        // Nil values should be equal
+        let nil1 = Value::Nil { span: test_span() };
+        let nil2 = Value::Nil { span: test_span() };
+
+        assert_eq!(nil1.cmp(&nil2), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_bool() {
+        // false < true
+        let false_val = Value::Bool { span: test_span(), value: false };
+        let true_val = Value::Bool { span: test_span(), value: true };
+
+        assert!(false_val < true_val);
+        assert_eq!(false_val.cmp(&false_val), Ordering::Equal);
+        assert_eq!(true_val.cmp(&true_val), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_int() {
+        // Integer ordering
+        let small = Value::Int { span: test_span(), value: 1 };
+        let large = Value::Int { span: test_span(), value: 100 };
+
+        assert!(small < large);
+        assert_eq!(small.cmp(&small), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_float() {
+        // Float ordering
+        let small = Value::Float { span: test_span(), value: 1.0 };
+        let large = Value::Float { span: test_span(), value: 100.0 };
+
+        assert!(small < large);
+        assert_eq!(small.cmp(&small), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_char() {
+        // Character ordering
+        let a = Value::Char { span: test_span(), value: 'a' };
+        let z = Value::Char { span: test_span(), value: 'z' };
+
+        assert!(a < z);
+        assert_eq!(a.cmp(&a), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_string() {
+        // String ordering (lexicographic)
+        let a = Value::String { span: test_span(), value: "apple".to_string() };
+        let z = Value::String { span: test_span(), value: "zebra".to_string() };
+
+        assert!(a < z);
+        assert_eq!(a.cmp(&a), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_symbol() {
+        // Symbol ordering
+        let sym1 = sym("a");
+        let sym2 = sym("z");
+
+        assert!(sym1 < sym2);
+        assert_eq!(sym1.cmp(&sym1), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_keyword() {
+        // Keyword ordering
+        let kw1 = kw("a");
+        let kw2 = kw("z");
+
+        assert!(kw1 < kw2);
+        assert_eq!(kw1.cmp(&kw1), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_list() {
+        // List ordering
+        let empty = empty_list();
+        let single = list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
+        let multiple = list_with_meta(
+            vec![
+                Value::Int { span: test_span(), value: 1 },
+                Value::Int { span: test_span(), value: 2 },
+            ],
+            None,
+        );
+
+        assert!(empty < single);
+        assert!(single < multiple);
+        assert_eq!(empty.cmp(&empty), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_list_different_lengths() {
+        // Lists with different lengths
+        let short = list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
+        let long = list_with_meta(
+            vec![
+                Value::Int { span: test_span(), value: 1 },
+                Value::Int { span: test_span(), value: 2 },
+            ],
+            None,
+        );
+
+        assert!(short < long);
+    }
+
+    #[test]
+    fn test_ordering_list_different_contents() {
+        // Lists with different contents
+        let list1 = list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
+        let list2 = list_with_meta(vec![Value::Int { span: test_span(), value: 2 }], None);
+
+        assert!(list1 < list2);
+    }
+
+    #[test]
+    fn test_ordering_vector() {
+        // Vector ordering
+        let empty = Value::Vector { span: test_span(), value: vec![], meta: None };
+        let single = Value::Vector {
+            span: test_span(),
+            value: vec![Value::Int { span: test_span(), value: 1 }],
+            meta: None,
+        };
+
+        assert!(empty < single);
+        assert_eq!(empty.cmp(&empty), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_map() {
+        // Map ordering
+        let mut map1 = BTreeMap::new();
+        map1.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 10 });
+        let val1 = map_with_meta(map1, None);
+
+        let mut map2 = BTreeMap::new();
+        map2.insert(Value::Int { span: test_span(), value: 2 }, Value::Int { span: test_span(), value: 20 });
+        let val2 = map_with_meta(map2, None);
+
+        assert!(val1 < val2);
+        assert_eq!(val1.cmp(&val1), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_ordering_set() {
+        // Set ordering
+        let mut set1 = BTreeSet::new();
+        set1.insert(Value::Int { span: test_span(), value: 1 });
+        let val1 = Value::Set { span: test_span(), value: set1, meta: None };
+
+        let mut set2 = BTreeSet::new();
+        set2.insert(Value::Int { span: test_span(), value: 2 });
+        let val2 = Value::Set { span: test_span(), value: set2, meta: None };
+
+        assert!(val1 < val2);
+        assert_eq!(val1.cmp(&val1), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_equality_collections_ignore_metadata() {
+        // Collections with same content but different metadata should be equal
+        let mut meta1 = BTreeMap::new();
+        meta1.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
+        let list1 = list_with_meta(vec![Value::Int { span: test_span(), value: 42 }], Some(meta1));
+
+        let mut meta2 = BTreeMap::new();
+        meta2.insert(interner::intern_kw("key2"), Value::Int { span: test_span(), value: 2 });
+        let list2 = list_with_meta(vec![Value::Int { span: test_span(), value: 42 }], Some(meta2));
+
+        assert_eq!(list1, list2);
+    }
+
+    #[test]
+    fn test_equality_empty_collections() {
+        // Empty collections of the same type should be equal
+        let list1 = empty_list();
+        let list2 = empty_list();
+
+        assert_eq!(list1, list2);
+
+        let vec1 = Value::Vector { span: test_span(), value: vec![], meta: None };
+        let vec2 = Value::Vector { span: test_span(), value: vec![], meta: None };
+
+        assert_eq!(vec1, vec2);
+    }
+
+    #[test]
+    fn test_equality_collections_different_types() {
+        // Collections of different types should not be equal
+        let list = empty_list();
+        let vector = Value::Vector { span: test_span(), value: vec![], meta: None };
+        let map = empty_map();
+
+        assert_ne!(list, vector);
+        assert_ne!(list, map);
+        assert_ne!(vector, map);
+    }
+
+    #[test]
+    fn test_equality_float_special_values() {
+        // Special float values
+        let pos_inf = Value::Float { span: test_span(), value: f64::INFINITY };
+        let neg_inf = Value::Float { span: test_span(), value: f64::NEG_INFINITY };
+        let pos_inf2 = Value::Float { span: test_span(), value: f64::INFINITY };
+        let neg_inf2 = Value::Float { span: test_span(), value: f64::NEG_INFINITY };
+
+        assert_eq!(pos_inf, pos_inf2);
+        assert_eq!(neg_inf, neg_inf2);
+        assert_ne!(pos_inf, neg_inf);
+    }
+
+    #[test]
+    fn test_ordering_float_special_values() {
+        // Special float values ordering
+        let neg_inf = Value::Float { span: test_span(), value: f64::NEG_INFINITY };
+        let neg_num = Value::Float { span: test_span(), value: -100.0 };
+        let zero = Value::Float { span: test_span(), value: 0.0 };
+        let pos_num = Value::Float { span: test_span(), value: 100.0 };
+        let pos_inf = Value::Float { span: test_span(), value: f64::INFINITY };
+        let nan = Value::Float { span: test_span(), value: f64::NAN };
+
+        assert!(neg_inf < neg_num);
+        assert!(neg_num < zero);
+        assert!(zero < pos_num);
+        assert!(pos_num < pos_inf);
+        assert!(nan < neg_inf); // NaN is less than everything
+    }
+
+    #[test]
+    fn test_equality_map_keys_values() {
+        // Maps should compare by their key-value pairs
+        let mut map1 = BTreeMap::new();
+        map1.insert(Value::Int { span: test_span(), value: 1 }, Value::String { span: test_span(), value: "a".to_string() });
+        map1.insert(Value::Int { span: test_span(), value: 2 }, Value::String { span: test_span(), value: "b".to_string() });
+        let val1 = map_with_meta(map1, None);
+
+        let mut map2 = BTreeMap::new();
+        map2.insert(Value::Int { span: test_span(), value: 1 }, Value::String { span: test_span(), value: "a".to_string() });
+        map2.insert(Value::Int { span: test_span(), value: 2 }, Value::String { span: test_span(), value: "b".to_string() });
+        let val2 = map_with_meta(map2, None);
+
+        assert_eq!(val1, val2);
+    }
+
+    #[test]
+    fn test_equality_map_different_order() {
+        // Maps with same key-value pairs in different order should be equal
+        let mut map1 = BTreeMap::new();
+        map1.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 10 });
+        map1.insert(Value::Int { span: test_span(), value: 2 }, Value::Int { span: test_span(), value: 20 });
+        let val1 = map_with_meta(map1, None);
+
+        let mut map2 = BTreeMap::new();
+        map2.insert(Value::Int { span: test_span(), value: 2 }, Value::Int { span: test_span(), value: 20 });
+        map2.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 10 });
+        let val2 = map_with_meta(map2, None);
+
+        assert_eq!(val1, val2); // BTreeMap maintains order, so this should still be equal
+    }
+
+    #[test]
+    fn test_partial_cmp_always_some() {
+        // partial_cmp should always return Some for Value
+        let val1 = Value::Int { span: test_span(), value: 1 };
+        let val2 = Value::Int { span: test_span(), value: 2 };
+
+        assert!(val1.partial_cmp(&val2).is_some());
+        assert_eq!(val1.partial_cmp(&val2), Some(Ordering::Less));
+    }
+}

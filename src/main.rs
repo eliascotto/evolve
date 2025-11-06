@@ -1,10 +1,11 @@
 extern crate rustyline;
 extern crate itertools;
 extern crate logos;
+extern crate rustc_hash;
 
 use evolve::repl::REPL;
 use evolve::reader;
-use evolve::error::ErrorWithSpan;
+use evolve::error::Diagnostic;
 use evolve::devtools;
 use std::env;
 use std::path::Path;
@@ -65,7 +66,7 @@ fn parse_args(args: Vec<String>) -> Result<ArgCmd, String> {
     }
 }
 
-fn run_file(file_path: &str, print_ast: bool) -> Result<(), ErrorWithSpan> {
+fn run_file(file_path: &str, print_ast: bool) -> Result<(), Diagnostic> {
     let path = Path::new(file_path);
     let ast = reader::read_file(path)?;
     
@@ -101,7 +102,7 @@ fn main() {
             match run_file(&path, print_ast) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("{}", e.format_error());
+                    eprintln!("{}", e.format());
                     std::process::exit(1);
                 }
             }

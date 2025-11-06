@@ -1,4 +1,4 @@
 /target
+# ignore all hidden files and directories
+/.* 
 
-# rustyline history
-.evolve-history
