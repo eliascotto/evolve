@@ -43,6 +43,9 @@ pub enum SyntaxError {
     UnbalancedDelimiter { delimiter: char, position: usize },
     BadEscape { sequence: String },
     UnterminatedString,
+    WrongArgumentCount { error_str: String },
+    TooFewArguments { value: String },
+    TooManyArguments { value: String },
     InvalidNumber { value: String },
     InvalidCharacter { char: char },
     InvalidKeyword { value: String },
@@ -77,6 +80,15 @@ impl fmt::Display for SyntaxError {
                 write!(f, "Bad escape sequence: {}", sequence)
             }
             SyntaxError::UnterminatedString => write!(f, "Unterminated string"),
+            SyntaxError::WrongArgumentCount { error_str } => {
+                write!(f, "{}", error_str)
+            }
+            SyntaxError::TooManyArguments { value } => {
+                write!(f, "Too many arguments to {}", value)
+            }
+            SyntaxError::TooFewArguments { value } => {
+                write!(f, "Too few arguments to {}", value)
+            }
             SyntaxError::InvalidNumber { value } => {
                 write!(f, "Invalid number: {}", value)
             }

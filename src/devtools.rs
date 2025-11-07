@@ -39,7 +39,12 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
                 write!(result, "\n").unwrap();
                 for (i, item) in items.iter().enumerate() {
                     write!(result, "{}{}", indent_str, "  ").unwrap();
-                    write!(result, "{}", pretty_print_ast_with_indent(item, indent + 1)).unwrap();
+                    write!(
+                        result,
+                        "{}",
+                        pretty_print_ast_with_indent(item, indent + 1)
+                    )
+                    .unwrap();
                     if i < items.len() - 1 {
                         write!(result, "\n").unwrap();
                     }
@@ -57,7 +62,12 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
                 write!(result, "\n").unwrap();
                 for (i, item) in items.iter().enumerate() {
                     write!(result, "{}{}", indent_str, "  ").unwrap();
-                    write!(result, "{}", pretty_print_ast_with_indent(item, indent + 1)).unwrap();
+                    write!(
+                        result,
+                        "{}",
+                        pretty_print_ast_with_indent(item, indent + 1)
+                    )
+                    .unwrap();
                     if i < items.len() - 1 {
                         write!(result, "\n").unwrap();
                     }
@@ -76,8 +86,18 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
                 let entries: Vec<_> = map.iter().collect();
                 for (i, (k, v)) in entries.iter().enumerate() {
                     write!(result, "{}{}", indent_str, "  ").unwrap();
-                    write!(result, "{} ", pretty_print_ast_with_indent(k, indent + 1)).unwrap();
-                    write!(result, "{}", pretty_print_ast_with_indent(v, indent + 1)).unwrap();
+                    write!(
+                        result,
+                        "{} ",
+                        pretty_print_ast_with_indent(k, indent + 1)
+                    )
+                    .unwrap();
+                    write!(
+                        result,
+                        "{}",
+                        pretty_print_ast_with_indent(v, indent + 1)
+                    )
+                    .unwrap();
                     if i < entries.len() - 1 {
                         write!(result, "\n").unwrap();
                     }
@@ -96,7 +116,12 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
                 let items: Vec<_> = set.iter().collect();
                 for (i, item) in items.iter().enumerate() {
                     write!(result, "{}{}", indent_str, "  ").unwrap();
-                    write!(result, "{}", pretty_print_ast_with_indent(item, indent + 1)).unwrap();
+                    write!(
+                        result,
+                        "{}",
+                        pretty_print_ast_with_indent(item, indent + 1)
+                    )
+                    .unwrap();
                     if i < items.len() - 1 {
                         write!(result, "\n").unwrap();
                     }
@@ -105,9 +130,14 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
                 write!(result, "}}").unwrap();
             }
         }
-        Value::SpecialForm { span: _ } => write!(result, "SpecialForm").unwrap(),
         Value::Namespace { span: _, value: ns } => {
             write!(result, "Namespace:{}", interner::ns_to_str(*ns)).unwrap()
+        }
+        Value::SpecialForm { span: _, name: n } => {
+            write!(result, "SpecialForm:{}", interner::sym_to_str(*n)).unwrap()
+        }
+        Value::Function { span: _, name: n, params: _, body: _, env: _ } => {
+            write!(result, "Function:{}", interner::sym_to_str(*n)).unwrap()
         }
     }
 
@@ -130,11 +160,17 @@ mod tests {
     #[test]
     fn test_pretty_print_bool() {
         assert_eq!(
-            pretty_print_ast(&Value::Bool { span: Span { start: 0, end: 0 }, value: true }),
+            pretty_print_ast(&Value::Bool {
+                span: Span { start: 0, end: 0 },
+                value: true
+            }),
             "Bool:true"
         );
         assert_eq!(
-            pretty_print_ast(&Value::Bool { span: Span { start: 0, end: 0 }, value: false }),
+            pretty_print_ast(&Value::Bool {
+                span: Span { start: 0, end: 0 },
+                value: false
+            }),
             "Bool:false"
         );
     }
@@ -142,15 +178,24 @@ mod tests {
     #[test]
     fn test_pretty_print_int() {
         assert_eq!(
-            pretty_print_ast(&Value::Int { span: Span { start: 0, end: 0 }, value: 42 }),
+            pretty_print_ast(&Value::Int {
+                span: Span { start: 0, end: 0 },
+                value: 42
+            }),
             "Int:42"
         );
         assert_eq!(
-            pretty_print_ast(&Value::Int { span: Span { start: 0, end: 0 }, value: -100 }),
+            pretty_print_ast(&Value::Int {
+                span: Span { start: 0, end: 0 },
+                value: -100
+            }),
             "Int:-100"
         );
         assert_eq!(
-            pretty_print_ast(&Value::Int { span: Span { start: 0, end: 0 }, value: 0 }),
+            pretty_print_ast(&Value::Int {
+                span: Span { start: 0, end: 0 },
+                value: 0
+            }),
             "Int:0"
         );
     }
@@ -158,15 +203,24 @@ mod tests {
     #[test]
     fn test_pretty_print_float() {
         assert_eq!(
-            pretty_print_ast(&Value::Float { span: Span { start: 0, end: 0 }, value: 3.14 }),
+            pretty_print_ast(&Value::Float {
+                span: Span { start: 0, end: 0 },
+                value: 3.14
+            }),
             "Float:3.14"
         );
         assert_eq!(
-            pretty_print_ast(&Value::Float { span: Span { start: 0, end: 0 }, value: -42.5 }),
+            pretty_print_ast(&Value::Float {
+                span: Span { start: 0, end: 0 },
+                value: -42.5
+            }),
             "Float:-42.5"
         );
         assert_eq!(
-            pretty_print_ast(&Value::Float { span: Span { start: 0, end: 0 }, value: 0.0 }),
+            pretty_print_ast(&Value::Float {
+                span: Span { start: 0, end: 0 },
+                value: 0.0
+            }),
             "Float:0"
         );
     }
@@ -174,15 +228,24 @@ mod tests {
     #[test]
     fn test_pretty_print_char() {
         assert_eq!(
-            pretty_print_ast(&Value::Char { span: Span { start: 0, end: 0 }, value: 'a' }),
+            pretty_print_ast(&Value::Char {
+                span: Span { start: 0, end: 0 },
+                value: 'a'
+            }),
             "Char:\\a"
         );
         assert_eq!(
-            pretty_print_ast(&Value::Char { span: Span { start: 0, end: 0 }, value: ' ' }),
+            pretty_print_ast(&Value::Char {
+                span: Span { start: 0, end: 0 },
+                value: ' '
+            }),
             "Char:\\ "
         );
         assert_eq!(
-            pretty_print_ast(&Value::Char { span: Span { start: 0, end: 0 }, value: '\n' }),
+            pretty_print_ast(&Value::Char {
+                span: Span { start: 0, end: 0 },
+                value: '\n'
+            }),
             "Char:\\\n"
         );
     }
@@ -259,7 +322,11 @@ mod tests {
 
     #[test]
     fn test_pretty_print_empty_list() {
-        let value = Value::List { span: Span { start: 0, end: 0 }, value: vec![], meta: None };
+        let value = Value::List {
+            span: Span { start: 0, end: 0 },
+            value: vec![],
+            meta: None,
+        };
         assert_eq!(pretty_print_ast(&value), "List:()");
     }
 
@@ -301,7 +368,11 @@ mod tests {
 
     #[test]
     fn test_pretty_print_empty_vector() {
-        let value = Value::Vector { span: Span { start: 0, end: 0 }, value: vec![], meta: None };
+        let value = Value::Vector {
+            span: Span { start: 0, end: 0 },
+            value: vec![],
+            meta: None,
+        };
         assert_eq!(pretty_print_ast(&value), "Vector:[]");
     }
 
@@ -310,8 +381,14 @@ mod tests {
         let value = Value::Vector {
             span: Span { start: 0, end: 0 },
             value: vec![
-                Value::String { span: Span { start: 0, end: 0 }, value: "hello".to_string() },
-                Value::String { span: Span { start: 0, end: 0 }, value: "world".to_string() },
+                Value::String {
+                    span: Span { start: 0, end: 0 },
+                    value: "hello".to_string(),
+                },
+                Value::String {
+                    span: Span { start: 0, end: 0 },
+                    value: "world".to_string(),
+                },
             ],
             meta: None,
         };
@@ -321,8 +398,11 @@ mod tests {
 
     #[test]
     fn test_pretty_print_empty_map() {
-        let value =
-            Value::Map { span: Span { start: 0, end: 0 }, value: BTreeMap::new(), meta: None };
+        let value = Value::Map {
+            span: Span { start: 0, end: 0 },
+            value: BTreeMap::new(),
+            meta: None,
+        };
         assert_eq!(pretty_print_ast(&value), "Map:{}");
     }
 
@@ -330,14 +410,21 @@ mod tests {
     fn test_pretty_print_map() {
         let mut map = BTreeMap::new();
         map.insert(
-            Value::String { span: Span { start: 0, end: 0 }, value: "key1".to_string() },
+            Value::String {
+                span: Span { start: 0, end: 0 },
+                value: "key1".to_string(),
+            },
             Value::Int { span: Span { start: 0, end: 0 }, value: 1 },
         );
         map.insert(
-            Value::String { span: Span { start: 0, end: 0 }, value: "key2".to_string() },
+            Value::String {
+                span: Span { start: 0, end: 0 },
+                value: "key2".to_string(),
+            },
             Value::Int { span: Span { start: 0, end: 0 }, value: 2 },
         );
-        let value = Value::Map { span: Span { start: 0, end: 0 }, value: map, meta: None };
+        let value =
+            Value::Map { span: Span { start: 0, end: 0 }, value: map, meta: None };
         let output = pretty_print_ast(&value);
         // Since BTreeMap is ordered, we check that it contains the expected elements
         assert!(output.starts_with("Map:{\n"));
@@ -350,8 +437,11 @@ mod tests {
 
     #[test]
     fn test_pretty_print_empty_set() {
-        let value =
-            Value::Set { span: Span { start: 0, end: 0 }, value: BTreeSet::new(), meta: None };
+        let value = Value::Set {
+            span: Span { start: 0, end: 0 },
+            value: BTreeSet::new(),
+            meta: None,
+        };
         assert_eq!(pretty_print_ast(&value), "Set:{}");
     }
 
@@ -361,7 +451,8 @@ mod tests {
         set.insert(Value::Int { span: Span { start: 0, end: 0 }, value: 1 });
         set.insert(Value::Int { span: Span { start: 0, end: 0 }, value: 2 });
         set.insert(Value::Int { span: Span { start: 0, end: 0 }, value: 3 });
-        let value = Value::Set { span: Span { start: 0, end: 0 }, value: set, meta: None };
+        let value =
+            Value::Set { span: Span { start: 0, end: 0 }, value: set, meta: None };
         let output = pretty_print_ast(&value);
         // Since BTreeSet is ordered, we check that it contains the expected elements
         assert!(output.starts_with("Set:{\n"));
@@ -392,7 +483,10 @@ mod tests {
                                     span: Span { start: 0, end: 0 },
                                     value: "hello".to_string(),
                                 },
-                                Value::Bool { span: Span { start: 0, end: 0 }, value: true },
+                                Value::Bool {
+                                    span: Span { start: 0, end: 0 },
+                                    value: true,
+                                },
                             ],
                             meta: None,
                         },

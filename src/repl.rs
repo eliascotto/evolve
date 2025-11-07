@@ -1,7 +1,10 @@
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::{error::Diagnostic, reader, devtools};
+use crate::env::Env;
+use crate::expander::Expander;
+use crate::reader::Source;
+use crate::{devtools, error::Diagnostic, reader};
 
 pub struct REPL {
     pub print_ast: bool,
@@ -14,9 +17,13 @@ impl REPL {
 
     pub fn rep(&self, input: &str) -> Result<String, Diagnostic> {
         let ast = reader::read(input)?;
+        let expander = Expander::new(Env::new(), input.to_string(), Source::REPL);
+        let _hir = expander.expand(&ast)?;
+
         if self.print_ast {
             println!("{}", devtools::pretty_print_ast(&ast));
         }
+
         Ok(ast.to_string())
     }
 

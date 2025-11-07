@@ -6,7 +6,7 @@ use std::sync::Mutex;
 pub struct SymId(pub u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub struct KwId(pub u32);
+pub struct KeywId(pub u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NsId(pub u32);
@@ -74,7 +74,7 @@ impl Interner {
     // - ":foo/bar" -> stores "foo/bar"
     // - "::bar" -> caller should resolve to ":current-ns/bar" first
     // - ":bar" -> stores "bar" (unqualified)
-    fn intern_kw(&mut self, s: &str) -> KwId {
+    fn intern_kw(&mut self, s: &str) -> KeywId {
         let canon = s.strip_prefix(':').unwrap_or(s); // tolerate ":name" input
 
         // Handle double colon - this should be resolved by caller, but we handle it defensively
@@ -86,20 +86,20 @@ impl Interner {
             canon
         };
 
-        KwId(self.kws.intern(canon))
+        KeywId(self.kws.intern(canon))
     }
 
-    fn kw_text(&self, id: KwId) -> &str {
+    fn kw_text(&self, id: KeywId) -> &str {
         self.kws.resolve(id.0)
     }
 
-    fn kw_print(&self, id: KwId) -> String {
+    fn kw_print(&self, id: KeywId) -> String {
         format!(":{}", self.kw_text(id))
     }
 
     // Extract namespace and name from a keyword
     // Returns (namespace, name) where namespace is None if unqualified
-    pub fn kw_split(&self, id: KwId) -> (Option<&str>, &str) {
+    pub fn kw_split(&self, id: KeywId) -> (Option<&str>, &str) {
         let full = self.kw_text(id);
         if let Some(pos) = full.rfind('/') {
             let (ns, name) = full.split_at(pos);
@@ -134,19 +134,19 @@ pub fn sym_split(id: SymId) -> (Option<String>, String) {
     (ns.map(|s| s.to_string()), name.to_string())
 }
 
-pub fn intern_kw(s: &str) -> KwId {
+pub fn intern_kw(s: &str) -> KeywId {
     INTERNER.lock().unwrap().intern_kw(s)
 }
 
-pub fn kw_to_str(id: KwId) -> String {
+pub fn kw_to_str(id: KeywId) -> String {
     INTERNER.lock().unwrap().kw_text(id).to_owned()
 }
 
-pub fn kw_print(id: KwId) -> String {
+pub fn kw_print(id: KeywId) -> String {
     INTERNER.lock().unwrap().kw_print(id)
 }
 
-pub fn kw_split(id: KwId) -> (Option<String>, String) {
+pub fn kw_split(id: KeywId) -> (Option<String>, String) {
     let interner = INTERNER.lock().unwrap();
     let (ns, name) = interner.kw_split(id);
     (ns.map(|s| s.to_string()), name.to_string())

@@ -3,56 +3,131 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::env::Env;
 use crate::error::{Error, SyntaxError};
-use crate::interner::{self, KwId, NsId, SymId};
+use crate::interner::{self, KeywId, NsId, SymId};
 
 //===----------------------------------------------------------------------===//
-// AST
+// CST
 //===----------------------------------------------------------------------===//
 
 #[derive(Debug, Clone)]
 pub enum Value {
-    Nil { span: Span },
-    Bool { span: Span, value: bool },
+    // Primitives
+    Nil {
+        span: Span,
+    },
+    Bool {
+        span: Span,
+        value: bool,
+    },
 
-    Char { span: Span, value: char },
-    Int { span: Span, value: i64 },
-    Float { span: Span, value: f64 },
+    Char {
+        span: Span,
+        value: char,
+    },
+    Int {
+        span: Span,
+        value: i64,
+    },
+    Float {
+        span: Span,
+        value: f64,
+    },
 
-    String { span: Span, value: String },
+    String {
+        span: Span,
+        value: String,
+    },
 
-    Symbol { span: Span, value: SymId, meta: Option<BTreeMap<KwId, Value>> },
-    Keyword { span: Span, value: KwId },
+    Symbol {
+        span: Span,
+        value: SymId,
+        meta: Option<BTreeMap<KeywId, Value>>,
+    },
+    Keyword {
+        span: Span,
+        value: KeywId,
+    },
 
     // Collections
-    List { span: Span, value: Vec<Value>, meta: Option<BTreeMap<KwId, Value>> },
-    Vector { span: Span, value: Vec<Value>, meta: Option<BTreeMap<KwId, Value>> },
-    Map { span: Span, value: BTreeMap<Value, Value>, meta: Option<BTreeMap<KwId, Value>> },
-    Set { span: Span, value: BTreeSet<Value>, meta: Option<BTreeMap<KwId, Value>> },
+    List {
+        span: Span,
+        value: Vec<Value>,
+        meta: Option<BTreeMap<KeywId, Value>>,
+    },
+    Vector {
+        span: Span,
+        value: Vec<Value>,
+        meta: Option<BTreeMap<KeywId, Value>>,
+    },
+    Map {
+        span: Span,
+        value: BTreeMap<Value, Value>,
+        meta: Option<BTreeMap<KeywId, Value>>,
+    },
+    Set {
+        span: Span,
+        value: BTreeSet<Value>,
+        meta: Option<BTreeMap<KeywId, Value>>,
+    },
 
-    Namespace { span: Span, value: NsId },
+    // Namespace
+    Namespace {
+        span: Span,
+        value: NsId,
+    },
+
+    // Function
+    Function {
+        span: Span,
+        name: SymId,
+        params: Vec<Value>,
+        body: Box<Value>,
+        env: Box<Env>,
+    },
 
     // Internal
-    SpecialForm { span: Span },
+    SpecialForm {
+        span: Span,
+        name: SymId,
+    },
 }
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Nil { span: _ }, Value::Nil { span: _ }) => true,
-            (Value::Bool { span: _, value: a }, Value::Bool { span: _, value: b }) => a == b,
-            (Value::Char { span: _, value: a }, Value::Char { span: _, value: b }) => a == b,
-            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => a == b,
-            (Value::Float { span: _, value: a }, Value::Float { span: _, value: b }) => {
+            (
+                Value::Bool { span: _, value: a },
+                Value::Bool { span: _, value: b },
+            ) => a == b,
+            (
+                Value::Char { span: _, value: a },
+                Value::Char { span: _, value: b },
+            ) => a == b,
+            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => {
+                a == b
+            }
+            (
+                Value::Float { span: _, value: a },
+                Value::Float { span: _, value: b },
+            ) => {
                 // Handle NaN comparison
                 if a.is_nan() && b.is_nan() { true } else { a == b }
             }
-            (Value::String { span: _, value: a }, Value::String { span: _, value: b }) => a == b,
+            (
+                Value::String { span: _, value: a },
+                Value::String { span: _, value: b },
+            ) => a == b,
             (
                 Value::Symbol { span: _, value: a, meta: _ },
                 Value::Symbol { span: _, value: b, meta: _ },
             ) => a == b,
-            (Value::Keyword { span: _, value: a }, Value::Keyword { span: _, value: b }) => a == b,
+            (
+                Value::Keyword { span: _, value: a },
+                Value::Keyword { span: _, value: b },
+            ) => a == b,
             (
                 Value::List { span: _, value: a, meta: _ },
                 Value::List { span: _, value: b, meta: _ },
@@ -86,10 +161,21 @@ impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Value::Nil { span: _ }, Value::Nil { span: _ }) => Ordering::Equal,
-            (Value::Bool { span: _, value: a }, Value::Bool { span: _, value: b }) => a.cmp(b),
-            (Value::Char { span: _, value: a }, Value::Char { span: _, value: b }) => a.cmp(b),
-            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => a.cmp(b),
-            (Value::Float { span: _, value: a }, Value::Float { span: _, value: b }) => {
+            (
+                Value::Bool { span: _, value: a },
+                Value::Bool { span: _, value: b },
+            ) => a.cmp(b),
+            (
+                Value::Char { span: _, value: a },
+                Value::Char { span: _, value: b },
+            ) => a.cmp(b),
+            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => {
+                a.cmp(b)
+            }
+            (
+                Value::Float { span: _, value: a },
+                Value::Float { span: _, value: b },
+            ) => {
                 // Handle NaN comparison - NaN is considered less than any other value
                 if a.is_nan() && b.is_nan() {
                     Ordering::Equal
@@ -101,14 +187,18 @@ impl Ord for Value {
                     a.partial_cmp(b).unwrap_or(Ordering::Equal)
                 }
             }
-            (Value::String { span: _, value: a }, Value::String { span: _, value: b }) => a.cmp(b),
+            (
+                Value::String { span: _, value: a },
+                Value::String { span: _, value: b },
+            ) => a.cmp(b),
             (
                 Value::Symbol { span: _, value: a, meta: _ },
                 Value::Symbol { span: _, value: b, meta: _ },
             ) => a.0.cmp(&b.0),
-            (Value::Keyword { span: _, value: a }, Value::Keyword { span: _, value: b }) => {
-                a.0.cmp(&b.0)
-            }
+            (
+                Value::Keyword { span: _, value: a },
+                Value::Keyword { span: _, value: b },
+            ) => a.0.cmp(&b.0),
             (
                 Value::List { span: _, value: a, meta: _ },
                 Value::List { span: _, value: b, meta: _ },
@@ -144,12 +234,17 @@ impl fmt::Display for Value {
             Value::Float { span: _, value: val } => format!("{}", val),
             Value::Char { span: _, value: c } => format!("\\{}", c),
             Value::String { span: _, value: s } => s.clone(),
-            Value::Symbol { span: _, value: sym, meta: _ } => interner::sym_to_str(*sym),
+            Value::Symbol { span: _, value: sym, meta: _ } => {
+                interner::sym_to_str(*sym)
+            }
             Value::Keyword { span: _, value: kw } => interner::kw_print(*kw),
             Value::List { span: _, value: l, meta: _ } => pr_seq(&l, "(", ")", " "),
-            Value::Vector { span: _, value: v, meta: _ } => pr_seq(&v, "[", "]", " "),
+            Value::Vector { span: _, value: v, meta: _ } => {
+                pr_seq(&v, "[", "]", " ")
+            }
             Value::Map { span: _, value: hm, meta: _ } => {
-                let seq: Vec<Value> = hm.iter().flat_map(|(k, v)| [k.clone(), v.clone()]).collect();
+                let seq: Vec<Value> =
+                    hm.iter().flat_map(|(k, v)| [k.clone(), v.clone()]).collect();
                 pr_seq(&seq, "{", "}", " ")
             }
             Value::Set { span: _, value: set, meta: _ } => {
@@ -157,7 +252,12 @@ impl fmt::Display for Value {
                 pr_seq(&seq, "{", "}", " ")
             }
             Value::Namespace { span: _, value: ns } => interner::ns_to_str(*ns),
-            Value::SpecialForm { span: _ } => String::from("#<special-form>"),
+            Value::SpecialForm { span: _, name: n } => {
+                format!("#<special-form:{}>", interner::sym_to_str(*n))
+            }
+            Value::Function { span: _, name: n, params: _, body: _, env: _ } => {
+                format!("fn:{}", interner::sym_to_str(*n))
+            }
         };
         write!(f, "{}", s)
     }
@@ -179,11 +279,14 @@ impl Value {
             Value::Map { span: _, value: _, meta: _ } => "Map",
             Value::Set { span: _, value: _, meta: _ } => "Set",
             Value::Namespace { span: _, value: _ } => "Namespace",
-            Value::SpecialForm { span: _ } => "SpecialForm",
+            Value::SpecialForm { span: _, name: _ } => "SpecialForm",
+            Value::Function { span: _, name: _, params: _, body: _, env: _ } => {
+                "Function"
+            }
         }
     }
 
-    pub fn get_meta(&self) -> Option<BTreeMap<KwId, Value>> {
+    pub fn get_meta(&self) -> Option<BTreeMap<KeywId, Value>> {
         match self {
             Value::Symbol { meta, .. }
             | Value::List { meta, .. }
@@ -204,7 +307,10 @@ impl Value {
             | Value::Set { meta, .. } => meta.clone().unwrap_or_else(BTreeMap::new),
             _ => {
                 return Err(Error::SyntaxError(SyntaxError::InvalidMeta {
-                    reason: format!("Metadata cannot be applied to {}", self.to_string()),
+                    reason: format!(
+                        "Metadata cannot be applied to {}",
+                        self.to_string()
+                    ),
                 }));
             }
         };
@@ -213,8 +319,10 @@ impl Value {
         match meta_def {
             Value::Keyword { span: _, value: kw } => {
                 // If meta_def is a Keyword, set its value to true
-                meta_map
-                    .insert(kw, Value::Bool { span: Span { start: 0, end: 0 }, value: true });
+                meta_map.insert(
+                    kw,
+                    Value::Bool { span: Span { start: 0, end: 0 }, value: true },
+                );
             }
             Value::Map { span: _, value: hm, meta: _ } => {
                 // If meta_def is a Map, only Keyword values are allowed as keys
@@ -325,11 +433,15 @@ mod tests {
 
     // Helper function to create a symbol value
     fn sym(s: &str) -> Value {
-        Value::Symbol { span: test_span(), value: interner::intern_sym(s), meta: None }
+        Value::Symbol {
+            span: test_span(),
+            value: interner::intern_sym(s),
+            meta: None,
+        }
     }
 
     // Helper function to create a symbol with metadata
-    fn sym_with_meta(s: &str, meta: Option<BTreeMap<KwId, Value>>) -> Value {
+    fn sym_with_meta(s: &str, meta: Option<BTreeMap<KeywId, Value>>) -> Value {
         Value::Symbol { span: test_span(), value: interner::intern_sym(s), meta }
     }
 
@@ -339,7 +451,10 @@ mod tests {
     }
 
     // Helper function to create a list with metadata
-    fn list_with_meta(v: Vec<Value>, meta: Option<BTreeMap<KwId, Value>>) -> Value {
+    fn list_with_meta(
+        v: Vec<Value>,
+        meta: Option<BTreeMap<KeywId, Value>>,
+    ) -> Value {
         Value::List { span: test_span(), value: v, meta }
     }
 
@@ -349,7 +464,10 @@ mod tests {
     }
 
     // Helper function to create a map with metadata
-    fn map_with_meta(m: BTreeMap<Value, Value>, meta: Option<BTreeMap<KwId, Value>>) -> Value {
+    fn map_with_meta(
+        m: BTreeMap<Value, Value>,
+        meta: Option<BTreeMap<KeywId, Value>>,
+    ) -> Value {
         Value::Map { span: test_span(), value: m, meta }
     }
 
@@ -361,7 +479,10 @@ mod tests {
     fn test_get_meta_supported_types() {
         // Types that support metadata should return Some or None
         let mut meta_map = BTreeMap::new();
-        meta_map.insert(interner::intern_kw("test"), Value::Bool { span: test_span(), value: true });
+        meta_map.insert(
+            interner::intern_kw("test"),
+            Value::Bool { span: test_span(), value: true },
+        );
 
         let sym_with = sym_with_meta("test", Some(meta_map.clone()));
         let sym_without = sym("test");
@@ -384,10 +505,24 @@ mod tests {
         let int_val = Value::Int { span: test_span(), value: 42 };
         let float_val = Value::Float { span: test_span(), value: 3.14 };
         let char_val = Value::Char { span: test_span(), value: 'a' };
-        let string_val = Value::String { span: test_span(), value: "test".to_string() };
+        let string_val =
+            Value::String { span: test_span(), value: "test".to_string() };
         let keyword_val = kw("test");
-        let namespace_val = Value::Namespace { span: test_span(), value: interner::intern_ns("test") };
-        let special_form = Value::SpecialForm { span: test_span() };
+        let namespace_val = Value::Namespace {
+            span: test_span(),
+            value: interner::intern_ns("test"),
+        };
+        let special_form = Value::SpecialForm {
+            span: test_span(),
+            name: interner::intern_sym("test"),
+        };
+        let function = Value::Function {
+            span: test_span(),
+            name: interner::intern_sym("test"),
+            params: vec![],
+            body: Box::new(Value::Nil { span: test_span() }),
+            env: Box::new(Env::new()),
+        };
 
         assert!(nil.get_meta().is_none());
         assert!(bool_val.get_meta().is_none());
@@ -398,6 +533,7 @@ mod tests {
         assert!(keyword_val.get_meta().is_none());
         assert!(namespace_val.get_meta().is_none());
         assert!(special_form.get_meta().is_none());
+        assert!(function.get_meta().is_none());
     }
 
     #[test]
@@ -436,8 +572,12 @@ mod tests {
         let sym = sym("test-symbol");
         let mut meta_map = BTreeMap::new();
         meta_map.insert(kw("key1"), Value::Int { span: test_span(), value: 42 });
-        meta_map.insert(kw("key2"), Value::String { span: test_span(), value: "value".to_string() });
-        let meta_value = Value::Map { span: test_span(), value: meta_map, meta: None };
+        meta_map.insert(
+            kw("key2"),
+            Value::String { span: test_span(), value: "value".to_string() },
+        );
+        let meta_value =
+            Value::Map { span: test_span(), value: meta_map, meta: None };
 
         let result = sym.set_meta(meta_value).unwrap();
         let meta = result.get_meta().unwrap();
@@ -450,7 +590,8 @@ mod tests {
         // Setting metadata with invalid type should return an error
         let sym = sym("test-symbol");
         let invalid_meta = Value::Int { span: test_span(), value: 42 };
-        let invalid_meta2 = Value::String { span: test_span(), value: "invalid".to_string() };
+        let invalid_meta2 =
+            Value::String { span: test_span(), value: "invalid".to_string() };
 
         assert!(sym.set_meta(invalid_meta).is_err());
         assert!(sym.set_meta(invalid_meta2).is_err());
@@ -461,8 +602,12 @@ mod tests {
         // Setting metadata with a map that has non-keyword keys should return an error
         let sym = sym("test-symbol");
         let mut meta_map = BTreeMap::new();
-        meta_map.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 42 });
-        let meta_value = Value::Map { span: test_span(), value: meta_map, meta: None };
+        meta_map.insert(
+            Value::Int { span: test_span(), value: 1 },
+            Value::Int { span: test_span(), value: 42 },
+        );
+        let meta_value =
+            Value::Map { span: test_span(), value: meta_map, meta: None };
 
         assert!(sym.set_meta(meta_value).is_err());
     }
@@ -471,12 +616,16 @@ mod tests {
     fn test_set_meta_merges_existing() {
         // Setting metadata should merge with existing metadata
         let mut existing_meta = BTreeMap::new();
-        existing_meta.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
+        existing_meta.insert(
+            interner::intern_kw("key1"),
+            Value::Int { span: test_span(), value: 1 },
+        );
         let sym = sym_with_meta("test", Some(existing_meta));
 
         let mut new_meta_map = BTreeMap::new();
         new_meta_map.insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
-        let new_meta = Value::Map { span: test_span(), value: new_meta_map, meta: None };
+        let new_meta =
+            Value::Map { span: test_span(), value: new_meta_map, meta: None };
 
         let result = sym.set_meta(new_meta).unwrap();
         let meta = result.get_meta().unwrap();
@@ -490,12 +639,19 @@ mod tests {
     fn test_set_meta_overwrites_existing_key() {
         // Setting metadata should overwrite existing keys
         let mut existing_meta = BTreeMap::new();
-        existing_meta.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
+        existing_meta.insert(
+            interner::intern_kw("key1"),
+            Value::Int { span: test_span(), value: 1 },
+        );
         let sym = sym_with_meta("test", Some(existing_meta));
 
         let mut new_meta_map = BTreeMap::new();
-        new_meta_map.insert(kw("key1"), Value::String { span: test_span(), value: "new".to_string() });
-        let new_meta = Value::Map { span: test_span(), value: new_meta_map, meta: None };
+        new_meta_map.insert(
+            kw("key1"),
+            Value::String { span: test_span(), value: "new".to_string() },
+        );
+        let new_meta =
+            Value::Map { span: test_span(), value: new_meta_map, meta: None };
 
         let result = sym.set_meta(new_meta).unwrap();
         let meta = result.get_meta().unwrap();
@@ -511,7 +667,10 @@ mod tests {
     fn test_metadata_preserved_on_clone() {
         // Metadata should be preserved when cloning
         let mut meta_map = BTreeMap::new();
-        meta_map.insert(interner::intern_kw("test"), Value::Bool { span: test_span(), value: true });
+        meta_map.insert(
+            interner::intern_kw("test"),
+            Value::Bool { span: test_span(), value: true },
+        );
         let sym = sym_with_meta("test", Some(meta_map));
 
         let cloned = sym.clone();
@@ -526,7 +685,8 @@ mod tests {
         let list = empty_list();
         let vector = Value::Vector { span: test_span(), value: vec![], meta: None };
         let map = empty_map();
-        let set = Value::Set { span: test_span(), value: BTreeSet::new(), meta: None };
+        let set =
+            Value::Set { span: test_span(), value: BTreeSet::new(), meta: None };
 
         assert!(list.set_meta(meta_kw.clone()).is_ok());
         assert!(vector.set_meta(meta_kw.clone()).is_ok());
@@ -543,11 +703,17 @@ mod tests {
         // Two values with same content but different metadata should be equal
         let sym1 = sym("test");
         let mut meta1 = BTreeMap::new();
-        meta1.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
+        meta1.insert(
+            interner::intern_kw("key1"),
+            Value::Int { span: test_span(), value: 1 },
+        );
         let sym1_with_meta = sym_with_meta("test", Some(meta1));
 
         let mut meta2 = BTreeMap::new();
-        meta2.insert(interner::intern_kw("key2"), Value::Int { span: test_span(), value: 2 });
+        meta2.insert(
+            interner::intern_kw("key2"),
+            Value::Int { span: test_span(), value: 2 },
+        );
         let sym2_with_meta = sym_with_meta("test", Some(meta2));
 
         assert_eq!(sym1, sym1_with_meta);
@@ -559,7 +725,8 @@ mod tests {
         // Different types should not be equal
         let int_val = Value::Int { span: test_span(), value: 42 };
         let float_val = Value::Float { span: test_span(), value: 42.0 };
-        let string_val = Value::String { span: test_span(), value: "42".to_string() };
+        let string_val =
+            Value::String { span: test_span(), value: "42".to_string() };
 
         assert_ne!(int_val, float_val);
         assert_ne!(int_val, string_val);
@@ -601,7 +768,8 @@ mod tests {
         // Different types should compare as Equal (for ordering purposes)
         let int_val = Value::Int { span: test_span(), value: 42 };
         let float_val = Value::Float { span: test_span(), value: 42.0 };
-        let string_val = Value::String { span: test_span(), value: "42".to_string() };
+        let string_val =
+            Value::String { span: test_span(), value: "42".to_string() };
 
         assert_eq!(int_val.cmp(&float_val), Ordering::Equal);
         assert_eq!(int_val.cmp(&string_val), Ordering::Equal);
@@ -691,7 +859,8 @@ mod tests {
     fn test_ordering_list() {
         // List ordering
         let empty = empty_list();
-        let single = list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
+        let single =
+            list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
         let multiple = list_with_meta(
             vec![
                 Value::Int { span: test_span(), value: 1 },
@@ -708,7 +877,8 @@ mod tests {
     #[test]
     fn test_ordering_list_different_lengths() {
         // Lists with different lengths
-        let short = list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
+        let short =
+            list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
         let long = list_with_meta(
             vec![
                 Value::Int { span: test_span(), value: 1 },
@@ -723,8 +893,10 @@ mod tests {
     #[test]
     fn test_ordering_list_different_contents() {
         // Lists with different contents
-        let list1 = list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
-        let list2 = list_with_meta(vec![Value::Int { span: test_span(), value: 2 }], None);
+        let list1 =
+            list_with_meta(vec![Value::Int { span: test_span(), value: 1 }], None);
+        let list2 =
+            list_with_meta(vec![Value::Int { span: test_span(), value: 2 }], None);
 
         assert!(list1 < list2);
     }
@@ -747,11 +919,17 @@ mod tests {
     fn test_ordering_map() {
         // Map ordering
         let mut map1 = BTreeMap::new();
-        map1.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 10 });
+        map1.insert(
+            Value::Int { span: test_span(), value: 1 },
+            Value::Int { span: test_span(), value: 10 },
+        );
         let val1 = map_with_meta(map1, None);
 
         let mut map2 = BTreeMap::new();
-        map2.insert(Value::Int { span: test_span(), value: 2 }, Value::Int { span: test_span(), value: 20 });
+        map2.insert(
+            Value::Int { span: test_span(), value: 2 },
+            Value::Int { span: test_span(), value: 20 },
+        );
         let val2 = map_with_meta(map2, None);
 
         assert!(val1 < val2);
@@ -777,12 +955,24 @@ mod tests {
     fn test_equality_collections_ignore_metadata() {
         // Collections with same content but different metadata should be equal
         let mut meta1 = BTreeMap::new();
-        meta1.insert(interner::intern_kw("key1"), Value::Int { span: test_span(), value: 1 });
-        let list1 = list_with_meta(vec![Value::Int { span: test_span(), value: 42 }], Some(meta1));
+        meta1.insert(
+            interner::intern_kw("key1"),
+            Value::Int { span: test_span(), value: 1 },
+        );
+        let list1 = list_with_meta(
+            vec![Value::Int { span: test_span(), value: 42 }],
+            Some(meta1),
+        );
 
         let mut meta2 = BTreeMap::new();
-        meta2.insert(interner::intern_kw("key2"), Value::Int { span: test_span(), value: 2 });
-        let list2 = list_with_meta(vec![Value::Int { span: test_span(), value: 42 }], Some(meta2));
+        meta2.insert(
+            interner::intern_kw("key2"),
+            Value::Int { span: test_span(), value: 2 },
+        );
+        let list2 = list_with_meta(
+            vec![Value::Int { span: test_span(), value: 42 }],
+            Some(meta2),
+        );
 
         assert_eq!(list1, list2);
     }
@@ -847,13 +1037,25 @@ mod tests {
     fn test_equality_map_keys_values() {
         // Maps should compare by their key-value pairs
         let mut map1 = BTreeMap::new();
-        map1.insert(Value::Int { span: test_span(), value: 1 }, Value::String { span: test_span(), value: "a".to_string() });
-        map1.insert(Value::Int { span: test_span(), value: 2 }, Value::String { span: test_span(), value: "b".to_string() });
+        map1.insert(
+            Value::Int { span: test_span(), value: 1 },
+            Value::String { span: test_span(), value: "a".to_string() },
+        );
+        map1.insert(
+            Value::Int { span: test_span(), value: 2 },
+            Value::String { span: test_span(), value: "b".to_string() },
+        );
         let val1 = map_with_meta(map1, None);
 
         let mut map2 = BTreeMap::new();
-        map2.insert(Value::Int { span: test_span(), value: 1 }, Value::String { span: test_span(), value: "a".to_string() });
-        map2.insert(Value::Int { span: test_span(), value: 2 }, Value::String { span: test_span(), value: "b".to_string() });
+        map2.insert(
+            Value::Int { span: test_span(), value: 1 },
+            Value::String { span: test_span(), value: "a".to_string() },
+        );
+        map2.insert(
+            Value::Int { span: test_span(), value: 2 },
+            Value::String { span: test_span(), value: "b".to_string() },
+        );
         let val2 = map_with_meta(map2, None);
 
         assert_eq!(val1, val2);
@@ -863,13 +1065,25 @@ mod tests {
     fn test_equality_map_different_order() {
         // Maps with same key-value pairs in different order should be equal
         let mut map1 = BTreeMap::new();
-        map1.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 10 });
-        map1.insert(Value::Int { span: test_span(), value: 2 }, Value::Int { span: test_span(), value: 20 });
+        map1.insert(
+            Value::Int { span: test_span(), value: 1 },
+            Value::Int { span: test_span(), value: 10 },
+        );
+        map1.insert(
+            Value::Int { span: test_span(), value: 2 },
+            Value::Int { span: test_span(), value: 20 },
+        );
         let val1 = map_with_meta(map1, None);
 
         let mut map2 = BTreeMap::new();
-        map2.insert(Value::Int { span: test_span(), value: 2 }, Value::Int { span: test_span(), value: 20 });
-        map2.insert(Value::Int { span: test_span(), value: 1 }, Value::Int { span: test_span(), value: 10 });
+        map2.insert(
+            Value::Int { span: test_span(), value: 2 },
+            Value::Int { span: test_span(), value: 20 },
+        );
+        map2.insert(
+            Value::Int { span: test_span(), value: 1 },
+            Value::Int { span: test_span(), value: 10 },
+        );
         let val2 = map_with_meta(map2, None);
 
         assert_eq!(val1, val2); // BTreeMap maintains order, so this should still be equal

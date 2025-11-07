@@ -1,12 +1,12 @@
-extern crate rustyline;
 extern crate itertools;
 extern crate logos;
 extern crate rustc_hash;
+extern crate rustyline;
 
-use evolve::repl::REPL;
-use evolve::reader;
-use evolve::error::Diagnostic;
 use evolve::devtools;
+use evolve::error::Diagnostic;
+use evolve::reader;
+use evolve::repl::REPL;
 use std::env;
 use std::path::Path;
 
@@ -24,7 +24,9 @@ fn print_usage() {
     println!("Usage:");
     println!("  evolve                    Start the REPL");
     println!("  evolve --file <path>      Execute a file");
-    println!("  evolve --print-ast        Pretty-print AST before output (works with REPL and --file)");
+    println!(
+        "  evolve --print-ast        Pretty-print AST before output (works with REPL and --file)"
+    );
     println!("  evolve -h                 Show this help message");
 }
 
@@ -69,11 +71,11 @@ fn parse_args(args: Vec<String>) -> Result<ArgCmd, String> {
 fn run_file(file_path: &str, print_ast: bool) -> Result<(), Diagnostic> {
     let path = Path::new(file_path);
     let ast = reader::read_file(path)?;
-    
+
     if print_ast {
         println!("{}", devtools::pretty_print_ast(&ast));
     }
-    
+
     println!("{}", ast.to_string());
     Ok(())
 }
@@ -98,14 +100,12 @@ fn main() {
             let repl = REPL::new(print_ast);
             repl.run();
         }
-        ArgCmd::File { path, print_ast } => {
-            match run_file(&path, print_ast) {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("{}", e.format());
-                    std::process::exit(1);
-                }
+        ArgCmd::File { path, print_ast } => match run_file(&path, print_ast) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("{}", e.format());
+                std::process::exit(1);
             }
-        }
+        },
     }
 }
