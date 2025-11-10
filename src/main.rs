@@ -4,11 +4,10 @@ extern crate rustc_hash;
 extern crate rustyline;
 
 use evolve::devtools;
-use evolve::error::Diagnostic;
-use evolve::reader;
+use evolve::error::{Diagnostic, Error};
+use evolve::reader::{Reader, Source};
 use evolve::repl::REPL;
-use std::env;
-use std::path::Path;
+use std::{env, fs, path::Path};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -70,7 +69,16 @@ fn parse_args(args: Vec<String>) -> Result<ArgCmd, String> {
 
 fn run_file(file_path: &str, print_ast: bool) -> Result<(), Diagnostic> {
     let path = Path::new(file_path);
-    let ast = reader::read_file(path)?;
+    let source_code = fs::read_to_string(path).map_err(|e| Diagnostic {
+        error: Error::RuntimeError(format!("Failed to read file: {}", e)),
+        span: 0..0,
+        source: String::new(),
+        file: Source::File(path.to_path_buf()),
+        secondary_spans: None,
+        notes: None,
+    })?;
+
+    let ast = Reader::read(&source_code, Source::File(path.to_path_buf()))?;
 
     if print_ast {
         println!("{}", devtools::pretty_print_ast(&ast));

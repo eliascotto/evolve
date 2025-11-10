@@ -2,3 +2,4 @@
 # ignore all hidden files and directories
 /.* 
 
+/docs/*

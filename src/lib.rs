@@ -1,12 +1,10 @@
-pub mod reader;
-pub mod value;
-pub mod repl;
-pub mod error;
+pub mod collections;
 pub mod devtools;
 pub mod env;
 pub mod error;
-pub mod expander;
+pub mod eval;
 pub mod interner;
+pub mod core;
 pub mod reader;
 pub mod repl;
 pub mod value;

@@ -136,8 +136,20 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
         Value::SpecialForm { span: _, name: n } => {
             write!(result, "SpecialForm:{}", interner::sym_to_str(*n)).unwrap()
         }
-        Value::Function { span: _, name: n, params: _, body: _, env: _ } => {
-            write!(result, "Function:{}", interner::sym_to_str(*n)).unwrap()
+        Value::Function { span: _, name: n, params: _, body: _, env: _ } => write!(
+            result,
+            "Function:{}",
+            match n {
+                Some(sym) => interner::sym_to_str(*sym),
+                None => "anon".to_string(),
+            }
+        )
+        .unwrap(),
+        Value::Var { span: _, value: v } => {
+            write!(result, "Var:{}", interner::sym_to_str(v.symbol)).unwrap()
+        }
+        Value::NativeFunction { span: _, name: n, f: _ } => {
+            write!(result, "NativeFunction:{}", interner::sym_to_str(*n)).unwrap()
         }
     }
 
@@ -147,9 +159,10 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::{List, Map, Set, Vector};
+    use crate::reader::Span;
     use crate::value::Value;
-    use logos::Span;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     #[test]
     fn test_pretty_print_nil() {
@@ -255,28 +268,28 @@ mod tests {
         assert_eq!(
             pretty_print_ast(&Value::String {
                 span: Span { start: 0, end: 0 },
-                value: "hello".to_string()
+                value: Arc::from("hello")
             }),
             "String:\"hello\""
         );
         assert_eq!(
             pretty_print_ast(&Value::String {
                 span: Span { start: 0, end: 0 },
-                value: "".to_string()
+                value: Arc::from("")
             }),
             "String:\"\""
         );
         assert_eq!(
             pretty_print_ast(&Value::String {
                 span: Span { start: 0, end: 0 },
-                value: "test \"quote\"".to_string()
+                value: Arc::from("test \"quote\"")
             }),
             "String:\"test \\\"quote\\\"\""
         );
         assert_eq!(
             pretty_print_ast(&Value::String {
                 span: Span { start: 0, end: 0 },
-                value: "back\\slash".to_string()
+                value: Arc::from("back\\slash")
             }),
             "String:\"back\\\\slash\""
         );
@@ -324,7 +337,7 @@ mod tests {
     fn test_pretty_print_empty_list() {
         let value = Value::List {
             span: Span { start: 0, end: 0 },
-            value: vec![],
+            value: Arc::new(List::new()),
             meta: None,
         };
         assert_eq!(pretty_print_ast(&value), "List:()");
@@ -334,11 +347,11 @@ mod tests {
     fn test_pretty_print_list() {
         let value = Value::List {
             span: Span { start: 0, end: 0 },
-            value: vec![
+            value: Arc::new(List::from_iter(vec![
                 Value::Int { span: Span { start: 0, end: 0 }, value: 1 },
                 Value::Int { span: Span { start: 0, end: 0 }, value: 2 },
                 Value::Int { span: Span { start: 0, end: 0 }, value: 3 },
-            ],
+            ])),
             meta: None,
         };
         let expected = "List:(\n  Int:1\n  Int:2\n  Int:3\n)";
@@ -349,17 +362,17 @@ mod tests {
     fn test_pretty_print_nested_list() {
         let value = Value::List {
             span: Span { start: 0, end: 0 },
-            value: vec![
+            value: Arc::new(List::from_iter(vec![
                 Value::Int { span: Span { start: 0, end: 0 }, value: 1 },
                 Value::List {
                     span: Span { start: 0, end: 0 },
-                    value: vec![
+                    value: Arc::new(List::from_iter(vec![
                         Value::Int { span: Span { start: 0, end: 0 }, value: 2 },
                         Value::Int { span: Span { start: 0, end: 0 }, value: 3 },
-                    ],
+                    ])),
                     meta: None,
                 },
-            ],
+            ])),
             meta: None,
         };
         let expected = "List:(\n  Int:1\n  List:(\n    Int:2\n    Int:3\n  )\n)";
@@ -370,7 +383,7 @@ mod tests {
     fn test_pretty_print_empty_vector() {
         let value = Value::Vector {
             span: Span { start: 0, end: 0 },
-            value: vec![],
+            value: Arc::new(Vector::new()),
             meta: None,
         };
         assert_eq!(pretty_print_ast(&value), "Vector:[]");
@@ -380,16 +393,16 @@ mod tests {
     fn test_pretty_print_vector() {
         let value = Value::Vector {
             span: Span { start: 0, end: 0 },
-            value: vec![
+            value: Arc::new(Vector::from_iter(vec![
                 Value::String {
                     span: Span { start: 0, end: 0 },
-                    value: "hello".to_string(),
+                    value: Arc::from("hello"),
                 },
                 Value::String {
                     span: Span { start: 0, end: 0 },
-                    value: "world".to_string(),
+                    value: Arc::from("world"),
                 },
-            ],
+            ])),
             meta: None,
         };
         let expected = "Vector:[\n  String:\"hello\"\n  String:\"world\"\n]";
@@ -400,7 +413,7 @@ mod tests {
     fn test_pretty_print_empty_map() {
         let value = Value::Map {
             span: Span { start: 0, end: 0 },
-            value: BTreeMap::new(),
+            value: Arc::new(Map::new()),
             meta: None,
         };
         assert_eq!(pretty_print_ast(&value), "Map:{}");
@@ -408,25 +421,29 @@ mod tests {
 
     #[test]
     fn test_pretty_print_map() {
-        let mut map = BTreeMap::new();
-        map.insert(
-            Value::String {
-                span: Span { start: 0, end: 0 },
-                value: "key1".to_string(),
-            },
-            Value::Int { span: Span { start: 0, end: 0 }, value: 1 },
-        );
-        map.insert(
-            Value::String {
-                span: Span { start: 0, end: 0 },
-                value: "key2".to_string(),
-            },
-            Value::Int { span: Span { start: 0, end: 0 }, value: 2 },
-        );
-        let value =
-            Value::Map { span: Span { start: 0, end: 0 }, value: map, meta: None };
+        let map = Map::from_iter(vec![
+            (
+                Value::String {
+                    span: Span { start: 0, end: 0 },
+                    value: Arc::from("key1"),
+                },
+                Value::Int { span: Span { start: 0, end: 0 }, value: 1 },
+            ),
+            (
+                Value::String {
+                    span: Span { start: 0, end: 0 },
+                    value: Arc::from("key2"),
+                },
+                Value::Int { span: Span { start: 0, end: 0 }, value: 2 },
+            ),
+        ]);
+        let value = Value::Map {
+            span: Span { start: 0, end: 0 },
+            value: Arc::new(map),
+            meta: None,
+        };
         let output = pretty_print_ast(&value);
-        // Since BTreeMap is ordered, we check that it contains the expected elements
+        // Since Map preserves insertion order, we check that it contains the expected elements
         assert!(output.starts_with("Map:{\n"));
         assert!(output.contains("String:\"key1\""));
         assert!(output.contains("String:\"key2\""));
@@ -439,7 +456,7 @@ mod tests {
     fn test_pretty_print_empty_set() {
         let value = Value::Set {
             span: Span { start: 0, end: 0 },
-            value: BTreeSet::new(),
+            value: Arc::new(Set::new()),
             meta: None,
         };
         assert_eq!(pretty_print_ast(&value), "Set:{}");
@@ -447,14 +464,18 @@ mod tests {
 
     #[test]
     fn test_pretty_print_set() {
-        let mut set = BTreeSet::new();
-        set.insert(Value::Int { span: Span { start: 0, end: 0 }, value: 1 });
-        set.insert(Value::Int { span: Span { start: 0, end: 0 }, value: 2 });
-        set.insert(Value::Int { span: Span { start: 0, end: 0 }, value: 3 });
-        let value =
-            Value::Set { span: Span { start: 0, end: 0 }, value: set, meta: None };
+        let set = Set::from_iter(vec![
+            Value::Int { span: Span { start: 0, end: 0 }, value: 1 },
+            Value::Int { span: Span { start: 0, end: 0 }, value: 2 },
+            Value::Int { span: Span { start: 0, end: 0 }, value: 3 },
+        ]);
+        let value = Value::Set {
+            span: Span { start: 0, end: 0 },
+            value: Arc::new(set),
+            meta: None,
+        };
         let output = pretty_print_ast(&value);
-        // Since BTreeSet is ordered, we check that it contains the expected elements
+        // Since Set preserves insertion order, we check that it contains the expected elements
         assert!(output.starts_with("Set:{\n"));
         assert!(output.contains("Int:1"));
         assert!(output.contains("Int:2"));
@@ -466,7 +487,7 @@ mod tests {
     fn test_pretty_print_complex_nested() {
         let value = Value::List {
             span: Span { start: 0, end: 0 },
-            value: vec![
+            value: Arc::new(List::from_iter(vec![
                 Value::Symbol {
                     span: Span { start: 0, end: 0 },
                     value: interner::intern_sym("foo"),
@@ -474,26 +495,26 @@ mod tests {
                 },
                 Value::List {
                     span: Span { start: 0, end: 0 },
-                    value: vec![
+                    value: Arc::new(List::from_iter(vec![
                         Value::Int { span: Span { start: 0, end: 0 }, value: 1 },
                         Value::Vector {
                             span: Span { start: 0, end: 0 },
-                            value: vec![
+                            value: Arc::new(Vector::from_iter(vec![
                                 Value::String {
                                     span: Span { start: 0, end: 0 },
-                                    value: "hello".to_string(),
+                                    value: Arc::from("hello"),
                                 },
                                 Value::Bool {
                                     span: Span { start: 0, end: 0 },
                                     value: true,
                                 },
-                            ],
+                            ])),
                             meta: None,
                         },
-                    ],
+                    ])),
                     meta: None,
                 },
-            ],
+            ])),
             meta: None,
         };
         let expected = "List:(\n  Symbol:foo\n  List:(\n    Int:1\n    Vector:[\n      String:\"hello\"\n      Bool:true\n    ]\n  )\n)";

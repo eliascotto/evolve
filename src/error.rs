@@ -1,7 +1,10 @@
-use logos::Span;
 use std::fmt;
+use std::sync::Arc;
 
-use crate::reader::Source;
+use crate::collections::Vector;
+use crate::core::RecurContext;
+use crate::reader::{Source, Span};
+use crate::value::Value;
 
 //===----------------------------------------------------------------------===//
 // Error
@@ -11,10 +14,19 @@ use crate::reader::Source;
 pub enum Error {
     SyntaxError(SyntaxError),
     RuntimeError(String),
-    TypeError(String, String),
+    TypeError { expected: String, actual: String },
     ValueError(String),
     IndexError(String),
     KeyError(String),
+
+    //--------------------------------------------------//
+    // RecursionError
+    //
+    // A RecursionSignal is a signal to the evaluator to perform a recursive call.
+    // It contains the context of the recursion (loop or function)
+    // and the arguments to be passed to the recursive call.
+    //--------------------------------------------------//
+    RecurSignal { context: RecurContext, args: Arc<Vector<Value>> },
 }
 
 impl fmt::Display for Error {
@@ -22,12 +34,19 @@ impl fmt::Display for Error {
         match self {
             Error::SyntaxError(e) => write!(f, "{}", e),
             Error::RuntimeError(e) => write!(f, "Runtime error: {}", e),
-            Error::TypeError(expected, got) => {
-                write!(f, "Type error: expected {}, got {}", expected, got)
+            Error::TypeError { expected, actual } => {
+                write!(f, "Type error: expected {}, got {}", expected, actual)
             }
             Error::ValueError(e) => write!(f, "Value error: {}", e),
             Error::IndexError(e) => write!(f, "Index error: {}", e),
             Error::KeyError(e) => write!(f, "Key error: {}", e),
+            Error::RecurSignal { context, args } => {
+                write!(
+                    f,
+                    "Internal Recursion signal: context: {:?}, args: {:?}",
+                    context, args
+                )
+            }
         }
     }
 }
@@ -54,6 +73,7 @@ pub enum SyntaxError {
     InvalidVector { reason: String },
     InvalidMap { reason: String },
     InvalidMeta { reason: String },
+    InvalidDeclaration { reason: String },
 }
 
 impl fmt::Display for SyntaxError {
@@ -112,6 +132,9 @@ impl fmt::Display for SyntaxError {
             }
             SyntaxError::InvalidMeta { reason } => {
                 write!(f, "{}", reason)
+            }
+            SyntaxError::InvalidDeclaration { reason } => {
+                write!(f, "Invalid declaration: {}", reason)
             }
         }
     }

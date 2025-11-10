@@ -1,34 +1,126 @@
-use rustc_hash::FxHashMap;
+//! Environment for variable bindings with lexical scoping support.
+//!
+//! # Design
+//!
+//! Environments are **immutable** - `set` returns a new `Env`. This enables thread-safe sharing
+//! via `Arc`, safe closure capture, and preserved state for debugging.
+//!
+//! # Performance
+//!
+//! Uses `Map<SymId, Value>` (HAMT-based persistent map) instead of `FxHashMap` for efficient
+//! immutable updates:
+//! - **FxHashMap `set` operation**: O(n) - must clone entire map, copying all entries
+//! - **Persistent Map `set` operation**: O(log n) - uses structural sharing, only new nodes created
+//! - **Trade-off**: Persistent Map `get` operation is O(log n) vs FxHashMap's O(1), but acceptable
+//!   for typical sizes (< 1000 bindings)
+//!
+//! For runtime evaluation with `set!` (mutation), consider mutable environments using
+//! `Rc<RefCell<FxHashMap>>` or `Arc<Mutex<FxHashMap>>`.
 
+use std::sync::Arc;
+
+use crate::collections::{Map, Vector};
 use crate::interner::SymId;
+use crate::core::Var;
+use crate::core::{Namespace, RecurContext};
 use crate::value::Value;
 
+/// Environment for variable bindings with lexical scoping support.
 #[derive(Debug, Clone)]
 pub struct Env {
-    pub parent: Option<Box<Env>>,
-    pub bindings: FxHashMap<SymId, Value>,
+    // Namespace binding
+    pub ns: Arc<Namespace>,
+    // Parent environment
+    pub parent: Option<Arc<Env>>,
+    // Variable bindings
+    pub bindings: Map<SymId, Value>,
+
+    //--------------------------------------------------//
+    // Used by recur to know what context it's in
+    // and what arguments to pass to the recursive call.
+    recur_context: Option<RecurContext>,
 }
 
 impl Env {
-    pub fn new() -> Self {
-        Self { parent: None, bindings: FxHashMap::default() }
+    pub fn new(ns: Arc<Namespace>) -> Self {
+        Self { ns, parent: None, bindings: Map::new(), recur_context: None }
     }
 
+    /// Returns the value if found, otherwise looks in the parent environment.
     pub fn get(&self, key: SymId) -> Option<&Value> {
         self.bindings
             .get(&key)
             .or_else(|| self.parent.as_ref().and_then(|p| p.get(key)))
     }
 
-    pub fn set(&mut self, key: SymId, value: Value) {
-        self.bindings.insert(key, value);
+    /// Returns a new environment with the key bound to the value.
+    pub fn set(&self, key: SymId, value: Value) -> Self {
+        Self {
+            ns: self.ns.clone(),
+            bindings: self.bindings.insert(key, value),
+            parent: self.parent.clone(),
+            recur_context: self.recur_context.clone(),
+        }
     }
 
-    pub fn find(&self, key: SymId) -> Option<&Value> {
-        if self.bindings.contains_key(&key) {
-            Some(self.bindings.get(&key).unwrap())
-        } else {
-            self.parent.as_ref().and_then(|p| p.find(key))
+    pub fn insert_ns(&self, sym: SymId, var: Arc<Var>) -> Self {
+        Self {
+            ns: Arc::new(self.ns.insert(sym, var)),
+            bindings: self.bindings.clone(),
+            parent: self.parent.clone(),
+            recur_context: self.recur_context.clone(),
         }
+    }
+
+    /// Creates a new environment with the same namespace and bindings, but a new parent environment.
+    pub fn create_child(&self) -> Self {
+        Self {
+            ns: self.ns.clone(),
+            bindings: self.bindings.clone(),
+            parent: Some(Arc::new(self.clone())),
+            recur_context: self.recur_context.clone(),
+        }
+    }
+
+    /// Creates a new environment with the same namespace,
+    /// with parent bindings plus the given bindings.
+    ///
+    /// `bindings` should be a vector of pairs: [sym1 val1 sym2 val2 ...]
+    /// where sym1, sym2, etc. are symbols and val1, val2, etc. are values.
+    pub fn create_child_with_bindings(&self, bindings: Arc<Vector<Value>>) -> Self {
+        let mut new_bindings = Map::new();
+
+        // Process bindings in pairs: [sym1 val1 sym2 val2 ...]
+        let mut iter = bindings.iter();
+        while let (Some(param), Some(arg)) = (iter.next(), iter.next()) {
+            match param {
+                Value::Symbol { value: sym, .. } => {
+                    new_bindings = new_bindings.insert(*sym, arg.clone());
+                }
+                _ => {
+                    // Invalid binding - param must be a symbol
+                    // This should be caught earlier, but handle gracefully
+                    continue;
+                }
+            }
+        }
+
+        Self {
+            ns: self.ns.clone(),
+            bindings: new_bindings,
+            parent: Some(Arc::new(self.clone())),
+            recur_context: self.recur_context.clone(),
+        }
+    }
+
+    /// Creates a new environment setting the recursion context.
+    pub fn with_recur_context(mut self, context: RecurContext) -> Self {
+        self.recur_context = Some(context);
+        self
+    }
+
+    /// Returns the recursion context if set, otherwise None.
+    pub fn get_recur_context(&self) -> Option<&RecurContext> {
+        self.recur_context.as_ref()
     }
 }

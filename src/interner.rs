@@ -159,3 +159,69 @@ pub fn intern_ns(ns: &str) -> NsId {
 pub fn ns_to_str(id: NsId) -> String {
     INTERNER.lock().unwrap().ns_str(id).to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intern_same_symbol_returns_same_id() {
+        let id1 = intern_sym("foo");
+        let id2 = intern_sym("foo");
+        assert_eq!(id1, id2);
+        assert_eq!(sym_to_str(id1), "foo");
+    }
+
+    #[test]
+    fn intern_different_symbols_returns_different_ids() {
+        let id1 = intern_sym("foo");
+        let id2 = intern_sym("bar");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn sym_split_unqualified() {
+        let id = intern_sym("foo");
+        let (ns, name) = sym_split(id);
+        assert_eq!(ns, None);
+        assert_eq!(name, "foo");
+    }
+
+    #[test]
+    fn sym_split_qualified() {
+        let id = intern_sym("user/foo");
+        let (ns, name) = sym_split(id);
+        assert_eq!(ns, Some("user".to_string()));
+        assert_eq!(name, "foo");
+    }
+
+    #[test]
+    fn kw_intern_strips_colon() {
+        let id = intern_kw(":foo");
+        assert_eq!(kw_to_str(id), "foo");
+        assert_eq!(kw_print(id), ":foo");
+    }
+
+    #[test]
+    fn kw_intern_without_colon() {
+        let id = intern_kw("foo");
+        assert_eq!(kw_to_str(id), "foo");
+        assert_eq!(kw_print(id), ":foo");
+    }
+
+    #[test]
+    fn kw_split_qualified() {
+        let id = intern_kw(":user/foo");
+        let (ns, name) = kw_split(id);
+        assert_eq!(ns, Some("user".to_string()));
+        assert_eq!(name, "foo");
+    }
+
+    #[test]
+    fn namespace_intern() {
+        let id1 = intern_ns("user");
+        let id2 = intern_ns("user");
+        assert_eq!(id1, id2);
+        assert_eq!(ns_to_str(id1), "user");
+    }
+}
