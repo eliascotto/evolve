@@ -9,20 +9,6 @@ use crate::value::Value;
 use crate::interner::{self, SymId};
 
 //===----------------------------------------------------------------------===//
-// Utils
-//===----------------------------------------------------------------------===//
-fn synthetic_span() -> Span {
-    Span { start: 0, end: 0 }
-}
-
-fn type_error(expected: &str, actual: &Value) -> Error {
-    Error::TypeError {
-        expected: expected.to_string(),
-        actual: actual.as_str().to_string(),
-    }
-}
-
-//===----------------------------------------------------------------------===//
 // Native Functions
 //===----------------------------------------------------------------------===//
 
@@ -337,4 +323,18 @@ pub fn count(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
     })?;
 
     Ok(Value::Int { span: synthetic_span(), value: int_value })
+}
+
+//===----------------------------------------------------------------------===//
+// Utils
+//===----------------------------------------------------------------------===//
+fn synthetic_span() -> Span {
+    Span { start: 0, end: 0 }
+}
+
+fn type_error(expected: &str, actual: &Value) -> Error {
+    Error::TypeError {
+        expected: expected.to_string(),
+        actual: actual.as_str().to_string(),
+    }
 }

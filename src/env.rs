@@ -82,8 +82,12 @@ impl Env {
         }
     }
 
-    /// Creates a new environment with the same namespace,
-    /// with parent bindings plus the given bindings.
+    /// Creates a new environment with the same namespace, but replaces the local
+    /// bindings with the supplied vector while keeping the parent pointer.
+    ///
+    /// The trampoline evaluator relies on this helper to materialise lexical
+    /// scopes without mutating the parent `Env` instance, allowing tail-position
+    /// evaluation to swap environments cheaply.
     ///
     /// `bindings` should be a vector of pairs: [sym1 val1 sym2 val2 ...]
     /// where sym1, sym2, etc. are symbols and val1, val2, etc. are values.

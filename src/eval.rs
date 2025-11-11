@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::collections::{List, Vector};
-use crate::core::native_fns::{NativeFn, NativeRegistry};
+use crate::core::native_fns::NativeRegistry;
 use crate::core::{RecurContext, Var};
 use crate::env::Env;
 use crate::error::{Error, SyntaxError};
-use crate::interner::{self, KeywId, SymId};
+use crate::interner::{self, SymId};
 use crate::reader::Span;
 use crate::value::Value;
 
@@ -36,171 +36,287 @@ impl CoreSyms {
     }
 }
 
+/// Result of executing a single trampoline step.
+enum Step {
+    /// The evaluator produced a value and an updated environment.
+    Value(Value, Env),
+    /// The evaluator wants to continue by tail-calling into the given form. If
+    /// `restore` is `Some(env)`, the environment should be restored to `env`
+    /// once the tail expression completes (used for constructs such as loops
+    /// and function bodies that execute in a child environment).
+    Tail { form: Value, env: Env, restore: Option<Env> },
+    /// Internal trampoline signal indicating that a recur instruction was
+    /// emitted.  Carries the recursion context, the evaluated arguments, and
+    /// the environment that produced them.
+    Recur(RecurContext, Arc<Vector<Value>>, Env),
+}
+
+/// A trampoline interpreter that shares infrastructure with the legacy
+/// recursive evaluator but keeps evaluation inside an explicit loop.
 pub struct Evaluator {
-    pub core_syms: CoreSyms,
-    native_fns: NativeRegistry,
+    core_syms: Arc<CoreSyms>,
+    native_fns: Arc<NativeRegistry>,
 }
 
 impl Evaluator {
+    /// Create a new trampoline engine backed by the shared core symbols and
+    /// native function registry.
     pub fn new() -> Self {
-        Self { core_syms: CoreSyms::new(), native_fns: NativeRegistry::new() }
+        let core_syms = Arc::new(CoreSyms::new());
+        let native_fns = Arc::new(NativeRegistry::new());
+
+        Self { core_syms, native_fns }
     }
 
-    fn synthetic_span() -> Span {
-        Span { start: 0, end: 0 }
-    }
-
+    /// Evaluate a form using the trampoline loop.
+    ///
+    /// The method mirrors `Evaluator::eval` but never relies on the Rust call
+    /// stack for tail position.  Instead it accumulates the next form to
+    /// evaluate and iterates until a value is produced.
     pub fn eval(&self, form: &Value, env: &mut Env) -> Result<Value, Error> {
-        match form {
-            Value::Symbol { value: sym, .. } => match env.get(*sym).cloned() {
-                Some(value) => Ok(value),
-                None => {
-                    if self.is_special_form(*sym) {
-                        Ok(Value::SpecialForm {
-                            span: Self::synthetic_span(),
-                            name: *sym,
-                        })
-                    } else if let Some(f) = self.native_fns.resolve(*sym) {
-                        Ok(Value::NativeFunction {
-                            span: Self::synthetic_span(),
-                            name: *sym,
-                            f,
-                        })
-                    } else {
-                        Err(Error::RuntimeError(format!(
-                            "Undefined symbol: {:?}",
-                            sym
-                        )))
+        let mut current_form = form.clone();
+        let mut current_env = env.clone();
+        // We need to keep track of the environments that we need to restore
+        let mut restore_stack: Vec<Env> = Vec::new();
+
+        loop {
+            match self.eval_step(current_form.clone(), current_env.clone())? {
+                Step::Value(value, mut next_env) => {
+                    while let Some(restore_env) = restore_stack.pop() {
+                        next_env = restore_env;
                     }
+                    *env = next_env.clone();
+                    return Ok(value);
                 }
-            },
-            Value::List { value: list, span, .. } => {
-                if list.is_empty() {
-                    Ok(Value::Nil { span: span.clone() })
-                } else {
-                    self.eval_list(list, env)
+                Step::Tail { form: next_form, env: next_env, restore } => {
+                    if let Some(restore_env) = restore {
+                        restore_stack.push(restore_env);
+                    }
+                    current_form = next_form;
+                    current_env = next_env;
                 }
+                Step::Recur(context, args, mut next_env) => match context {
+                    RecurContext::Loop { bindings, body } => {
+                        if args.len() != bindings.len() {
+                            return Err(Error::SyntaxError(
+                                SyntaxError::WrongArgumentCount {
+                                    error_str: format!(
+                                        "Wrong number of arguments to recur. Expected {}, got {}",
+                                        bindings.len(),
+                                        args.len()
+                                    ),
+                                },
+                            ));
+                        }
+
+                        for (binding, new_value) in bindings.iter().zip(args.iter())
+                        {
+                            if let Value::Symbol { value: sym, .. } = binding {
+                                next_env = next_env.set(*sym, new_value.clone());
+                            }
+                        }
+
+                        current_form = self.make_do_value(body.clone());
+                        current_env = next_env;
+                    }
+                    RecurContext::Function { params, body } => {
+                        if args.len() != params.len() {
+                            return Err(Error::SyntaxError(
+                                SyntaxError::WrongArgumentCount {
+                                    error_str: format!(
+                                        "Wrong number of arguments to recur. Expected {}, got {}",
+                                        params.len(),
+                                        args.len()
+                                    ),
+                                },
+                            ));
+                        }
+
+                        for (param, new_value) in params.iter().zip(args.iter()) {
+                            if let Value::Symbol { value: sym, .. } = param {
+                                next_env = next_env.set(*sym, new_value.clone());
+                            }
+                        }
+
+                        current_form = self.make_do_value(body.clone());
+                        current_env = next_env;
+                    }
+                },
             }
-            Value::Vector { value: vector, span, .. } => {
-                let evaluated: Vec<Value> = vector
-                    .iter()
-                    .map(|v| self.eval(v, env))
-                    .collect::<Result<Vec<_>, Error>>()?;
-                Ok(Value::Vector {
-                    value: Arc::new(Vector::from_iter(evaluated)),
-                    span: span.clone(),
-                    meta: None,
-                })
-            }
-            _ => Ok(form.clone()),
         }
     }
 
-    fn eval_list(&self, list: &List<Value>, env: &mut Env) -> Result<Value, Error> {
-        let first = list.head().unwrap();
-        let func = self.eval(first, env)?;
-        match &func {
+    fn eval_step(&self, form: Value, env: Env) -> Result<Step, Error> {
+        match form {
+            Value::Symbol { value: sym, .. } => self.eval_symbol(sym, env),
+            Value::List { value: list, span, .. } => self.eval_list(list, span, env),
+            Value::Vector { value: vector, span, .. } => {
+                self.eval_vector(vector, span, env)
+            }
+            primitive => Ok(Step::Value(primitive, env)),
+        }
+    }
+
+    fn eval_symbol(&self, sym: SymId, env: Env) -> Result<Step, Error> {
+        if let Some(value) = env.get(sym).cloned() {
+            return Ok(Step::Value(value, env));
+        }
+
+        if self.is_special_form(sym) {
+            return Ok(Step::Value(
+                Value::SpecialForm { span: synthetic_span(), name: sym },
+                env,
+            ));
+        }
+
+        if let Some(f) = self.native_fns.resolve(sym) {
+            return Ok(Step::Value(
+                Value::NativeFunction { span: synthetic_span(), name: sym, f },
+                env,
+            ));
+        }
+
+        Err(Error::RuntimeError(format!("Undefined symbol: {:?}", sym)))
+    }
+
+    fn eval_vector(
+        &self,
+        vector: Arc<Vector<Value>>,
+        span: Span,
+        mut env: Env,
+    ) -> Result<Step, Error> {
+        let mut items = Vec::with_capacity(vector.len());
+        for form in vector.iter() {
+            let value = self.eval(form, &mut env)?;
+            items.push(value);
+        }
+        Ok(Step::Value(
+            Value::Vector {
+                span,
+                value: Arc::new(Vector::from_iter(items)),
+                meta: None,
+            },
+            env,
+        ))
+    }
+
+    fn eval_list(
+        &self,
+        list: Arc<List<Value>>,
+        span: Span,
+        mut env: Env,
+    ) -> Result<Step, Error> {
+        if list.is_empty() {
+            return Ok(Step::Value(Value::Nil { span }, env));
+        }
+
+        let head = list.head().unwrap().clone();
+        let args = list.tail().unwrap_or_else(List::new);
+
+        let func = self.eval(&head, &mut env)?;
+        match func {
             Value::SpecialForm { name: sym, .. } => {
-                self.eval_special_form(sym, list, env)
+                self.eval_special_form(sym, args, env)
             }
-            Value::NativeFunction { name: sym, f, .. } => {
-                self.eval_native_function(sym, *f, list, env)
+            Value::NativeFunction { f, .. } => {
+                let evaluated_args = self.collect_args(&args, &mut env)?;
+                let result = f(&evaluated_args, &mut env)?;
+                Ok(Step::Value(result, env))
             }
-            Value::Function { .. } => {
-                let args = self.collect_call_args(list, env)?;
-                self.apply(&func, &args, env)
+            Value::Function { params, body, env: fn_env, .. } => {
+                let evaluated_args = self.collect_args(&args, &mut env)?;
+                if params.len() != evaluated_args.len() {
+                    return Err(Error::SyntaxError(
+                        SyntaxError::WrongArgumentCount {
+                            error_str: format!(
+                                "Wrong number of arguments. Expected {}, got {}",
+                                params.len(),
+                                evaluated_args.len()
+                            ),
+                        },
+                    ));
+                }
+
+                let mut binding_pairs = Vec::new();
+                for (param, arg_value) in params.iter().zip(evaluated_args.iter()) {
+                    binding_pairs.push(param.clone());
+                    binding_pairs.push(arg_value.clone());
+                }
+                let bindings = Arc::new(Vector::from_iter(binding_pairs));
+                let call_env = fn_env
+                    .create_child_with_bindings(bindings)
+                    .with_recur_context(RecurContext::Function {
+                        params: params.clone(),
+                        body: body.clone(),
+                    });
+                let body_form = self.make_do_value(body.clone());
+                Ok(Step::Tail { form: body_form, env: call_env, restore: Some(env) })
             }
-            _ => Err(Error::TypeError {
+            other => Err(Error::TypeError {
                 expected: "callable".to_string(),
-                actual: func.as_str().to_string(),
+                actual: other.as_str().to_string(),
             }),
         }
     }
 
-    fn collect_call_args(
+    fn collect_args(
         &self,
-        list: &List<Value>,
+        args: &List<Value>,
         env: &mut Env,
     ) -> Result<Vec<Value>, Error> {
-        match list.tail() {
-            Some(args_list) => args_list
-                .iter()
-                .map(|v| self.eval(v, env))
-                .collect::<Result<Vec<_>, Error>>(),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn eval_native_function(
-        &self,
-        _sym: &SymId,
-        f: NativeFn,
-        list: &List<Value>,
-        env: &mut Env,
-    ) -> Result<Value, Error> {
-        let args = self.collect_call_args(list, env)?;
-        f(&args, env)
-    }
-
-    fn is_special_form(&self, sym: SymId) -> bool {
-        sym == self.core_syms.s_def
-            || sym == self.core_syms.s_if
-            || sym == self.core_syms.s_let
-            || sym == self.core_syms.s_fn
-            || sym == self.core_syms.s_do
-            || sym == self.core_syms.s_quote
-            || sym == self.core_syms.s_loop
-            || sym == self.core_syms.s_recur
+        args.iter().map(|form| self.eval(form, env)).collect()
     }
 
     fn eval_special_form(
         &self,
-        sym: &SymId,
-        list: &List<Value>,
-        env: &mut Env,
-    ) -> Result<Value, Error> {
-        let args = list.tail().unwrap_or_else(List::new);
-        if *sym == self.core_syms.s_def {
-            return self.eval_def(&args, env);
+        sym: SymId,
+        args: List<Value>,
+        env: Env,
+    ) -> Result<Step, Error> {
+        if sym == self.core_syms.s_def {
+            return self.eval_def(args, env);
         }
-        if *sym == self.core_syms.s_if {
-            return self.eval_if(&args, env);
+        if sym == self.core_syms.s_if {
+            return self.eval_if(args, env);
         }
-        if *sym == self.core_syms.s_let {
-            return self.eval_let(&args, env);
+        if sym == self.core_syms.s_let {
+            return self.eval_let(args, env);
         }
-        if *sym == self.core_syms.s_fn {
-            return self.eval_fn(&args, env);
+        if sym == self.core_syms.s_do {
+            return self.eval_do(args, env);
         }
-        if *sym == self.core_syms.s_do {
-            return self.eval_do(&args, env);
+        if sym == self.core_syms.s_quote {
+            return self.eval_quote(args, env);
         }
-        if *sym == self.core_syms.s_quote {
-            return self.eval_quote(&args, env);
+        if sym == self.core_syms.s_loop {
+            return self.eval_loop(args, env);
         }
-        if *sym == self.core_syms.s_loop {
-            return self.eval_loop(&args, env);
+        if sym == self.core_syms.s_recur {
+            return self.eval_recur(args, env);
         }
-        if *sym == self.core_syms.s_recur {
-            return self.eval_recur(&args, env);
+        if sym == self.core_syms.s_fn {
+            return self.eval_fn(args, env);
         }
+
         Err(Error::RuntimeError(format!("Unknown special form: {:?}", sym)))
     }
 
-    fn eval_def(&self, args: &List<Value>, env: &mut Env) -> Result<Value, Error> {
+    fn eval_def(&self, args: List<Value>, env: Env) -> Result<Step, Error> {
         if args.is_empty() {
             return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
                 error_str: "def requires at least 1 argument".to_string(),
             }));
         }
 
-        let mut sym_meta: Option<BTreeMap<KeywId, Value>>;
-        // Extract the symbol and its metadata
-        let sym = match args.head() {
-            Some(Value::Symbol { value: sym, meta, .. }) => {
-                sym_meta = meta.clone();
-                *sym
-            }
+        let mut iter = args.iter();
+        let symbol_value = iter.next().ok_or_else(|| {
+            Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                error_str: "def requires a symbol".to_string(),
+            })
+        })?;
+
+        let (sym, mut sym_meta) = match symbol_value {
+            Value::Symbol { value, meta, .. } => (*value, meta.clone()),
             _ => {
                 return Err(Error::SyntaxError(SyntaxError::InvalidSymbol {
                     value: "First argument to def must be a symbol".to_string(),
@@ -208,56 +324,37 @@ impl Evaluator {
             }
         };
 
-        let mut docstr: Option<String> = None;
-        // Extract the expression value and the eventual docstring
-        let expr_value: Value = match args.len() {
-            // No arguments, return nil
-            1 => Value::Nil { span: Span { start: 0, end: 0 } },
+        let mut docstring: Option<String> = None;
+        let expr_value = match iter.len() {
+            0 => Value::Nil { span: synthetic_span() },
+            1 => iter.next().unwrap().clone(),
             2 => {
-                let tail = args.tail().unwrap();
-                tail.head().cloned().unwrap()
-            }
-            3 => {
-                // 2nd argument is the docstring
-                let tail = args.tail().unwrap();
-                if let Some(second_value) = tail.head().cloned() {
-                    match &second_value {
-                        Value::String { value: doc, .. } => {
-                            docstr = Some(doc.to_string());
-                        }
-                        _ => {
-                            return Err(Error::SyntaxError(
-                                SyntaxError::UnexpectedToken {
-                                    found: second_value.to_string(),
-                                    expected: "string".to_string(),
-                                },
-                            ));
-                        }
-                    }
+                let potential_doc = iter.next().unwrap();
+                let maybe_expr = iter.next().unwrap();
+                if let Value::String { value: doc, .. } = potential_doc {
+                    docstring = Some(doc.to_string());
+                    maybe_expr.clone()
                 } else {
-                    unreachable!(
-                        "second argument should exist when args.len() == 3"
-                    );
+                    return Err(Error::SyntaxError(SyntaxError::UnexpectedToken {
+                        found: potential_doc.to_string(),
+                        expected: "string".to_string(),
+                    }));
                 }
-
-                // 3rd argument is the expression value
-                let third_list = tail.tail().unwrap();
-                third_list.head().cloned().unwrap()
             }
-            _ => {
+            len => {
                 return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
-                    error_str: "def requires at most 3 arguments".to_string(),
+                    error_str: format!(
+                        "def requires at most 3 arguments, got {}",
+                        len + 1
+                    ),
                 }));
             }
         };
 
-        // Add docstring to symbol metadata
-        if let Some(docstr) = docstr {
+        if let Some(doc) = docstring {
             let doc_kw = interner::intern_kw("doc");
-            let doc_value = Value::String {
-                span: Span { start: 0, end: 0 },
-                value: Arc::from(docstr),
-            };
+            let doc_value =
+                Value::String { span: synthetic_span(), value: Arc::from(doc) };
 
             match sym_meta.as_mut() {
                 Some(meta) => {
@@ -269,22 +366,24 @@ impl Evaluator {
             }
         }
 
-        // Evaluate the expression value
-        let expr_evaluated = self.eval(&expr_value, env)?;
+        let mut value_env = env.clone();
+        let evaluated = self.eval(&expr_value, &mut value_env)?;
 
-        // Create a new variable with the symbol, namespace, expr_evaluated value, and metadata
-        let var = Var::new_with_value(sym, env.ns.clone(), expr_evaluated, sym_meta);
+        let var = Var::new_with_value(
+            sym,
+            value_env.ns.clone(),
+            evaluated.clone(),
+            sym_meta,
+        );
         let var_arc = Arc::new(var);
         let var_value =
-            Value::Var { span: Span { start: 0, end: 0 }, value: var_arc.clone() };
+            Value::Var { span: synthetic_span(), value: var_arc.clone() };
 
-        // Set the variable globally in the namespace
-        *env = env.insert_ns(sym, var_arc);
-
-        Ok(var_value)
+        let new_env = value_env.insert_ns(sym, var_arc);
+        Ok(Step::Value(var_value, new_env))
     }
 
-    fn eval_if(&self, args: &List<Value>, env: &mut Env) -> Result<Value, Error> {
+    fn eval_if(&self, args: List<Value>, mut env: Env) -> Result<Step, Error> {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
                 error_str: "Wrong number of arguments to if. Expecting 2 or 3"
@@ -292,18 +391,51 @@ impl Evaluator {
             }));
         }
 
-        match self.eval(args.head().unwrap(), env) {
-            // If the condition is false or nil, evaluate the else branch
-            Ok(Value::Bool { value: false, .. }) | Ok(Value::Nil { .. }) => {
-                self.eval(args.tail().unwrap().tail().unwrap().head().unwrap(), env)
+        let mut iter = args.iter();
+        let condition = iter.next().unwrap();
+        let then_form = iter.next().unwrap().clone();
+        let else_form = iter.next().cloned();
+
+        let cond_value = self.eval(condition, &mut env)?;
+
+        match cond_value {
+            Value::Bool { value: false, .. } | Value::Nil { .. } => {
+                if let Some(else_branch) = else_form {
+                    Ok(Step::Tail { form: else_branch, env, restore: None })
+                } else {
+                    Ok(Step::Value(Value::Nil { span: synthetic_span() }, env))
+                }
             }
-            // Otherwise, evaluate the then branch
-            Ok(_) => self.eval(args.tail().unwrap().head().unwrap(), env),
-            _ => unreachable!("if condition must be a boolean or nil"),
+            _ => Ok(Step::Tail { form: then_form, env, restore: None }),
         }
     }
 
-    fn eval_let(&self, args: &List<Value>, env: &mut Env) -> Result<Value, Error> {
+    fn eval_do(&self, args: List<Value>, mut env: Env) -> Result<Step, Error> {
+        if args.is_empty() {
+            return Ok(Step::Value(Value::Nil { span: synthetic_span() }, env));
+        }
+
+        let mut forms: Vec<Value> = args.iter().cloned().collect();
+        let last = forms.pop().unwrap();
+
+        for form in forms {
+            let _ = self.eval(&form, &mut env)?;
+        }
+
+        Ok(Step::Tail { form: last, env, restore: None })
+    }
+
+    fn eval_quote(&self, args: List<Value>, env: Env) -> Result<Step, Error> {
+        if args.len() != 1 {
+            return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                error_str: "quote requires exactly 1 argument".to_string(),
+            }));
+        }
+
+        Ok(Step::Value(args.head().unwrap().clone(), env))
+    }
+
+    fn eval_let(&self, args: List<Value>, mut env: Env) -> Result<Step, Error> {
         if args.len() < 1 || args.len() > 2 {
             return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
                 error_str: "Wrong number of arguments to let. Expecting 1 or 2"
@@ -311,9 +443,9 @@ impl Evaluator {
             }));
         }
 
-        // (let [bindings...] body...)
-        let bindings = match args.head() {
-            Some(Value::Vector { value: bs, .. }) => bs,
+        let bindings_form = args.head().unwrap();
+        let bindings = match bindings_form {
+            Value::Vector { value, .. } => value.clone(),
             _ => {
                 return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
                     error_str: "First argument to let must be a vector".to_string(),
@@ -328,157 +460,122 @@ impl Evaluator {
             }));
         }
 
+        let mut binding_pairs = Vec::new();
+        let mut iter = bindings.iter();
+        while let (Some(param), Some(val_expr)) = (iter.next(), iter.next()) {
+            match param {
+                Value::Symbol { .. } => {
+                    let evaluated = self.eval(val_expr, &mut env)?;
+                    binding_pairs.push(param.clone());
+                    binding_pairs.push(evaluated);
+                }
+                _ => {
+                    return Err(Error::SyntaxError(SyntaxError::InvalidSymbol {
+                        value: "let binding parameters must be symbols".to_string(),
+                    }));
+                }
+            }
+        }
+
+        let bindings_vec = Arc::new(Vector::from_iter(binding_pairs));
+        let mut local_env = env.create_child_with_bindings(bindings_vec);
+
         match args.tail() {
             Some(body) => {
-                // Evaluate binding values: [sym1 val1_expr sym2 val2_expr ...]
-                // where val1_expr, val2_expr are expressions that need to be evaluated
-                let mut binding_pairs = Vec::new();
-                let mut iter = bindings.iter();
-                while let (Some(param), Some(val_expr)) = (iter.next(), iter.next())
-                {
-                    // param should be a symbol
-                    match param {
-                        Value::Symbol { .. } => {
-                            // Evaluate the value expression
-                            let evaluated_val = self.eval(val_expr, env)?;
-                            binding_pairs.push(param.clone());
-                            binding_pairs.push(evaluated_val);
-                        }
-                        _ => {
-                            return Err(Error::SyntaxError(
-                                SyntaxError::InvalidSymbol {
-                                    value: "let binding parameters must be symbols"
-                                        .to_string(),
-                                },
-                            ));
-                        }
+                if body.is_empty() {
+                    Ok(Step::Value(Value::Nil { span: synthetic_span() }, env))
+                } else {
+                    let mut forms: Vec<Value> = body.iter().cloned().collect();
+                    let last = forms.pop().unwrap();
+
+                    for form in forms {
+                        let _ = self.eval(&form, &mut local_env)?;
                     }
+
+                    let value = self.eval(&last, &mut local_env)?;
+                    Ok(Step::Value(value, env))
                 }
-
-                // Create environment with evaluated bindings
-                let bindings_vec = Arc::new(Vector::from_iter(binding_pairs));
-                let mut local_env = env.create_child_with_bindings(bindings_vec);
-
-                // Evaluate body in the local environment
-                self.eval_body(&body, &mut local_env)
             }
-            None => Ok(Value::Nil { span: Span { start: 0, end: 0 } }),
+            None => Ok(Step::Value(Value::Nil { span: synthetic_span() }, env)),
         }
     }
 
-    /// Evaluates a list of expressions and returns the last value.
-    fn eval_body(&self, body: &List<Value>, env: &mut Env) -> Result<Value, Error> {
-        let mut last_value = Value::Nil { span: Span { start: 0, end: 0 } };
-        for form in body {
-            last_value = self.eval(form, env)?;
-        }
-        Ok(last_value)
-    }
-
-    fn eval_fn(&self, args: &List<Value>, env: &mut Env) -> Result<Value, Error> {
-        if args.len() < 1 {
+    fn eval_fn(&self, args: List<Value>, env: Env) -> Result<Step, Error> {
+        if args.is_empty() {
             return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
                 error_str:
                     "Wrong number of arguments given to fn. Expecting at least 1"
                         .to_string(),
             }));
         }
-        let mut fn_iter = args.iter().peekable();
 
-        // (fn name? [params* ] expr*)
-        let fn_name = match fn_iter.peek() {
-            Some(Value::Symbol { value: sym, .. }) => {
-                fn_iter.next();
-                Some(*sym)
+        let mut iter = args.iter().peekable();
+        let fn_name = match iter.peek() {
+            Some(Value::Symbol { value, .. }) => {
+                let sym = *value;
+                iter.next();
+                Some(sym)
             }
             _ => None,
         };
 
-        match fn_iter.next() {
-            Some(Value::Vector { value: ps, .. }) => {
-                // (fn name? [params* ] expr*)
-                let body = fn_iter.cloned().collect::<List<Value>>();
-                let body_arc = if body.is_empty() {
-                    Arc::new(
-                        List::new()
-                            .prepend(Value::Nil { span: Span { start: 0, end: 0 } }),
-                    )
-                } else {
-                    Arc::new(body)
-                };
-                Ok(Value::Function {
-                    span: Span { start: 0, end: 0 },
-                    name: fn_name,
-                    params: ps.clone(),
-                    body: body_arc,
-                    env: Arc::new(env.clone()),
-                })
-            }
-            // Some(Value::List { value: ps, .. }) => {
-            //     // (fn name? ([params* ] expr*)+)
-            // },
+        let params = match iter.next() {
+            Some(Value::Vector { value, .. }) => value.clone(),
             _ => {
                 return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
-                    error_str:
-                        "fn arguments must be in the form of a vector or list"
-                            .to_string(),
+                    error_str: "fn arguments must be in the form of a vector"
+                        .to_string(),
                 }));
             }
-        }
-    }
+        };
 
-    fn eval_do(&self, args: &List<Value>, env: &mut Env) -> Result<Value, Error> {
-        if args.is_empty() {
-            Ok(Value::Nil { span: Span { start: 0, end: 0 } })
+        let body = iter.cloned().collect::<List<Value>>();
+        let body_arc = if body.is_empty() {
+            Arc::new(List::new().prepend(Value::Nil { span: synthetic_span() }))
         } else {
-            // (do body...)
-            self.eval_body(args, env)
-        }
+            Arc::new(body)
+        };
+
+        Ok(Step::Value(
+            Value::Function {
+                span: synthetic_span(),
+                name: fn_name,
+                params,
+                body: body_arc,
+                env: Arc::new(env.clone()),
+            },
+            env,
+        ))
     }
 
-    fn eval_quote(
-        &self,
-        args: &List<Value>,
-        _env: &mut Env,
-    ) -> Result<Value, Error> {
-        if args.len() != 1 {
-            return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
-                error_str: "quote requires exactly 1 argument".to_string(),
-            }));
-        }
-        Ok(args.head().unwrap().clone())
-    }
-
-    fn eval_loop(&self, args: &List<Value>, env: &mut Env) -> Result<Value, Error> {
-        if args.len() < 1 {
+    fn eval_loop(&self, args: List<Value>, mut env: Env) -> Result<Step, Error> {
+        if args.is_empty() {
             return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
                 error_str: "loop requires at least 1 argument".to_string(),
             }));
         }
 
-        // (loop [binding* ] expr*)
-        let (initial_bindings, loop_symbols) = match args.head() {
-            Some(Value::Vector { value: bs, .. }) => {
-                if bs.len() % 2 == 1 {
+        let bindings_value = args.head().unwrap();
+        let (initial_bindings, loop_symbols) = match bindings_value {
+            Value::Vector { value: vector, .. } => {
+                if vector.len() % 2 == 1 {
                     return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
-                        error_str: "loop binding vector requires an even number of forms"
-                            .to_string(),
+                        error_str:
+                            "loop binding vector requires an even number of forms".to_string(),
                     }));
                 }
-                // Create vector of pairs: [sym1 val1 sym2 val2 ...] with evaluated values
+
                 let mut binding_pairs = Vec::new();
                 let mut symbol_bindings = Vec::new();
-                let mut iter = bs.iter();
+                let mut iter = vector.iter();
                 while let (Some(param), Some(val_expr)) = (iter.next(), iter.next())
                 {
-                    // param should be a symbol
                     match param {
                         Value::Symbol { .. } => {
-                            // Evaluate the value expression
-                            let evaluated_val = self.eval(val_expr, env)?;
+                            let evaluated = self.eval(val_expr, &mut env)?;
                             symbol_bindings.push(param.clone());
                             binding_pairs.push(param.clone());
-                            binding_pairs.push(evaluated_val);
+                            binding_pairs.push(evaluated);
                         }
                         _ => {
                             return Err(Error::SyntaxError(
@@ -490,6 +587,7 @@ impl Evaluator {
                         }
                     }
                 }
+
                 (
                     Arc::new(Vector::from_iter(binding_pairs)),
                     Arc::new(Vector::from_iter(symbol_bindings)),
@@ -502,181 +600,82 @@ impl Evaluator {
             }
         };
 
-        if args.len() > 1 {
-            // Create new environment with bindings and recursion context
-            let mut loop_env = env
-                .create_child_with_bindings(initial_bindings)
-                .with_recur_context(RecurContext::Loop { bindings: loop_symbols });
-            // Evaluate body in the loop environment
-            let loop_body = args.tail().unwrap();
+        let body_list = Arc::new(args.tail().unwrap_or_else(List::new));
 
-            // Loop until completion or recur
-            loop {
-                match self.eval_body(&loop_body, &mut loop_env) {
-                    Ok(value) => return Ok(value), // Normal completion
+        let loop_env = env
+            .create_child_with_bindings(initial_bindings)
+            .with_recur_context(RecurContext::Loop {
+                bindings: loop_symbols.clone(),
+                body: body_list.clone(),
+            });
 
-                    Err(Error::RecurSignal {
-                        context: RecurContext::Loop { bindings },
-                        args,
-                    }) => {
-                        if args.len() != bindings.len() {
-                            return Err(Error::SyntaxError(
-                                SyntaxError::WrongArgumentCount {
-                                    error_str: format!(
-                                        "Wrong number of arguments to recur. Expected {}, got {}",
-                                        bindings.len(),
-                                        args.len()
-                                    ),
-                                },
-                            ));
-                        }
-
-                        // Update bindings in loop_env
-                        for (sym_val, new_val) in bindings.iter().zip(args.iter()) {
-                            match sym_val {
-                                Value::Symbol { value: sym, .. } => {
-                                    loop_env = loop_env.set(*sym, new_val.clone());
-                                }
-                                _ => unreachable!(
-                                    "loop binding parameters must be symbols"
-                                ),
-                            }
-                        }
-
-                        continue; // Continue loop
-                    }
-
-                    Err(e) => return Err(e), // Propagate other errors
-                }
-            }
-        } else {
-            Ok(Value::Nil { span: Span { start: 0, end: 0 } })
+        if body_list.is_empty() {
+            return Ok(Step::Value(Value::Nil { span: synthetic_span() }, env));
         }
+
+        let body_form = self.make_do_value(body_list);
+        Ok(Step::Tail { form: body_form, env: loop_env, restore: Some(env) })
     }
 
-    fn eval_recur(&self, args: &List<Value>, env: &mut Env) -> Result<Value, Error> {
+    fn eval_recur(&self, args: List<Value>, mut env: Env) -> Result<Step, Error> {
         let context = env.get_recur_context().cloned().ok_or_else(|| {
             Error::RuntimeError(
                 "recur can be used only inside loop or function".to_string(),
             )
         })?;
 
-        // Evaluate all arguments
-        let new_values = args
+        let evaluated_args = args
             .iter()
-            .map(|v| self.eval(v, env))
+            .map(|arg| self.eval(arg, &mut env))
             .collect::<Result<Vec<_>, Error>>()?;
 
-        // Validate count matches context
-        let expected_count = match &context {
-            RecurContext::Loop { bindings } => bindings.len(),
-            RecurContext::Function { params } => params.len(),
+        let expected_len = match &context {
+            RecurContext::Loop { bindings, .. } => bindings.len(),
+            RecurContext::Function { params, .. } => params.len(),
         };
 
-        if new_values.len() != expected_count {
+        if evaluated_args.len() != expected_len {
             return Err(Error::RuntimeError(format!(
                 "recur argument count mismatch: expected {}, got {}",
-                expected_count,
-                new_values.len()
+                expected_len,
+                evaluated_args.len()
             )));
         }
 
-        // Return RecurSignal
-        Err(Error::RecurSignal {
-            context,
-            args: Arc::new(Vector::from_iter(new_values)),
-        })
+        Ok(Step::Recur(context, Arc::new(Vector::from_iter(evaluated_args)), env))
     }
 
-    fn apply(
-        &self,
-        func: &Value,
-        args: &[Value],
-        env: &mut Env,
-    ) -> Result<Value, Error> {
-        match func {
-            Value::Function { params, body, .. } => {
-                // Check argument count
-                if params.len() != args.len() {
-                    return Err(Error::SyntaxError(
-                        SyntaxError::WrongArgumentCount {
-                            error_str: format!(
-                                "Wrong number of arguments. Expected {}, got {}",
-                                params.len(),
-                                args.len()
-                            ),
-                        },
-                    ));
-                }
+    fn is_special_form(&self, sym: SymId) -> bool {
+        sym == self.core_syms.s_def
+            || sym == self.core_syms.s_if
+            || sym == self.core_syms.s_let
+            || sym == self.core_syms.s_do
+            || sym == self.core_syms.s_quote
+            || sym == self.core_syms.s_loop
+            || sym == self.core_syms.s_recur
+            || sym == self.core_syms.s_fn
+    }
 
-                // Create vector of pairs: [param1 arg1 param2 arg2 ...]
-                let mut binding_pairs = Vec::new();
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    binding_pairs.push(param.clone());
-                    binding_pairs.push(arg.clone());
-                }
-                let bindings = Arc::new(Vector::from_iter(binding_pairs));
-
-                let fn_context = RecurContext::Function { params: params.clone() };
-
-                // Create new environment with bindings
-                let mut new_env = env
-                    .create_child_with_bindings(bindings)
-                    .with_recur_context(fn_context);
-
-                // Loop for TCO: evaluate body, catch recur, restart with new args
-                loop {
-                    match self.eval_body(body, &mut new_env) {
-                        Ok(value) => return Ok(value), // Normal completion
-
-                        Err(Error::RecurSignal {
-                            context: RecurContext::Function { params: fn_params },
-                            args,
-                        }) => {
-                            if args.len() != fn_params.len() {
-                                return Err(Error::SyntaxError(
-                                    SyntaxError::WrongArgumentCount {
-                                        error_str: format!(
-                                            "Wrong number of arguments to recur. Expected {}, got {}",
-                                            params.len(),
-                                            args.len()
-                                        ),
-                                    },
-                                ));
-                            }
-
-                            // Update bindings
-                            for (param, new_val) in fn_params.iter().zip(args.iter())
-                            {
-                                match param {
-                                    Value::Symbol { value: sym, .. } => {
-                                        new_env = new_env.set(*sym, new_val.clone());
-                                    }
-                                    _ => unreachable!(
-                                        "function parameters must be symbols"
-                                    ),
-                                }
-                            }
-
-                            continue; // Continue loop (TCO - no stack growth!)
-                        }
-
-                        Err(e) => return Err(e), // Propagate other errors
-                    }
-                }
+    fn make_do_value(&self, body: Arc<List<Value>>) -> Value {
+        if body.is_empty() {
+            Value::Nil { span: synthetic_span() }
+        } else {
+            let forms: Vec<Value> = body.iter().cloned().collect();
+            let mut list = List::new();
+            for form in forms.into_iter().rev() {
+                list = list.prepend(form);
             }
-            _ => Err(Error::TypeError {
-                expected: "function".to_string(),
-                actual: format!("{:?}", func),
-            }),
+            list = list.prepend(Value::SpecialForm {
+                span: synthetic_span(),
+                name: self.core_syms.s_do,
+            });
+            Value::List { span: synthetic_span(), value: Arc::new(list), meta: None }
         }
     }
 }
 
-impl Default for Evaluator {
-    fn default() -> Self {
-        Self::new()
-    }
+fn synthetic_span() -> Span {
+    Span { start: 0, end: 0 }
 }
 
 #[cfg(test)]
@@ -685,10 +684,7 @@ mod tests {
     use crate::collections::List;
     use crate::core::namespace;
 
-    fn test_span() -> Span {
-        Span { start: 0, end: 0 }
-    }
-
+    /// Setup a new evaluator and environment for testing.
     fn setup() -> (Evaluator, Env) {
         let eval = Evaluator::new();
         let ns = namespace::ns_find_or_create("test");
@@ -696,6 +692,8 @@ mod tests {
         (eval, env)
     }
 
+    /// Helper function to create a special form 
+    /// with a list that starts with a special form symbol.
     fn make_special_form_list(sym: SymId, args: Vec<Value>) -> Value {
         let mut list = List::new();
         // Add args in reverse order
@@ -703,20 +701,21 @@ mod tests {
             list = list.prepend(arg);
         }
         // Add special form at the front
-        list = list.prepend(Value::SpecialForm { span: test_span(), name: sym });
-        Value::List { span: test_span(), value: Arc::new(list), meta: None }
+        list =
+            list.prepend(Value::SpecialForm { span: synthetic_span(), name: sym });
+        Value::List { span: synthetic_span(), value: Arc::new(list), meta: None }
     }
 
     fn symbol(sym: SymId) -> Value {
-        Value::Symbol { span: test_span(), value: sym, meta: None }
+        Value::Symbol { span: synthetic_span(), value: sym, meta: None }
     }
 
     fn bool_val(value: bool) -> Value {
-        Value::Bool { span: test_span(), value }
+        Value::Bool { span: synthetic_span(), value }
     }
 
     fn int_val(value: i64) -> Value {
-        Value::Int { span: test_span(), value }
+        Value::Int { span: synthetic_span(), value }
     }
 
     fn build_three_stage_recur_body(
@@ -759,7 +758,7 @@ mod tests {
     #[test]
     fn test_eval_integer() {
         let (eval, mut env) = setup();
-        let form = Value::Int { span: test_span(), value: 42 };
+        let form = Value::Int { span: synthetic_span(), value: 42 };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::Int { value, .. } => assert_eq!(value, 42),
@@ -768,9 +767,20 @@ mod tests {
     }
 
     #[test]
+    fn test_trampoline_eval_integer() {
+        let (eval, mut env) = setup();
+        let form = Value::Int { span: synthetic_span(), value: 7 };
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 7),
+            _ => panic!("Expected Int(7), got {:?}", result),
+        }
+    }
+
+    #[test]
     fn test_eval_float() {
         let (eval, mut env) = setup();
-        let form = Value::Float { span: test_span(), value: 3.14 };
+        let form = Value::Float { span: synthetic_span(), value: 3.14 };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::Float { value, .. } => {
@@ -783,7 +793,8 @@ mod tests {
     #[test]
     fn test_eval_string() {
         let (eval, mut env) = setup();
-        let form = Value::String { span: test_span(), value: Arc::from("hello") };
+        let form =
+            Value::String { span: synthetic_span(), value: Arc::from("hello") };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::String { value, .. } => assert_eq!(value.as_ref(), "hello"),
@@ -792,9 +803,190 @@ mod tests {
     }
 
     #[test]
+    fn test_trampoline_eval_symbol_defined() {
+        let (eval, mut env) = setup();
+        let sym_id = interner::intern_sym("x");
+        let value = Value::Int { span: synthetic_span(), value: 21 };
+        env = env.set(sym_id, value.clone());
+
+        let form =
+            Value::Symbol { span: synthetic_span(), value: sym_id, meta: None };
+        let result = eval.eval(&form, &mut env).unwrap();
+
+        match result {
+            Value::Int { value: returned, .. } => assert_eq!(returned, 21),
+            _ => panic!("Expected Int(21), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_eval_symbol_undefined() {
+        let (eval, mut env) = setup();
+        let sym_id = interner::intern_sym("undefined-var");
+        let form =
+            Value::Symbol { span: synthetic_span(), value: sym_id, meta: None };
+
+        let result = eval.eval(&form, &mut env);
+        assert!(result.is_err());
+        match result {
+            Err(Error::RuntimeError(msg)) => {
+                assert!(msg.contains("Undefined symbol"));
+            }
+            _ => panic!("Expected RuntimeError, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_if_branches() {
+        let (eval, mut env) = setup();
+        let form = make_special_form_list(
+            eval.core_syms.s_if,
+            vec![
+                Value::Bool { span: synthetic_span(), value: true },
+                Value::Int { span: synthetic_span(), value: 1 },
+                Value::Int { span: synthetic_span(), value: 2 },
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 1),
+            other => panic!("Expected Int(1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_do_last_value() {
+        let (eval, mut env) = setup();
+        let form = make_special_form_list(
+            eval.core_syms.s_do,
+            vec![
+                Value::Int { span: synthetic_span(), value: 1 },
+                Value::Int { span: synthetic_span(), value: 2 },
+                Value::Int { span: synthetic_span(), value: 3 },
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 3),
+            other => panic!("Expected Int(3), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_quote_returns_literal() {
+        let (eval, mut env) = setup();
+        let quoted = Value::Int { span: synthetic_span(), value: 10 };
+        let form =
+            make_special_form_list(eval.core_syms.s_quote, vec![quoted.clone()]);
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 10),
+            other => panic!("Expected Int(10), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_let_scoping() {
+        let (eval, mut env) = setup();
+        let x_sym = interner::intern_sym("x");
+        let bindings_vec = Vector::from_iter(vec![
+            Value::Symbol { span: synthetic_span(), value: x_sym, meta: None },
+            Value::Int { span: synthetic_span(), value: 10 },
+        ]);
+        let form = make_special_form_list(
+            eval.core_syms.s_let,
+            vec![
+                Value::Vector {
+                    span: synthetic_span(),
+                    value: Arc::new(bindings_vec),
+                    meta: None,
+                },
+                Value::Symbol { span: synthetic_span(), value: x_sym, meta: None },
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 10),
+            other => panic!("Expected Int(10), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_def_updates_env() {
+        let (eval, mut env) = setup();
+        let sym = interner::intern_sym("def-test");
+        let form = make_special_form_list(
+            eval.core_syms.s_def,
+            vec![
+                Value::Symbol { span: synthetic_span(), value: sym, meta: None },
+                Value::Int { span: synthetic_span(), value: 99 },
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Var { .. } => {
+                let stored = env.ns.get(sym).expect("var stored in namespace");
+                let inner = stored.value.as_ref().unwrap().read().unwrap();
+                match &*inner {
+                    Value::Int { value, .. } => assert_eq!(*value, 99),
+                    other => panic!("Expected Int(99), found {:?}", other),
+                }
+            }
+            other => panic!("Expected Var value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_loop_recur_tail_calls() {
+        let (eval, mut env) = setup();
+
+        let flag_a = interner::intern_sym("flag-a");
+        let flag_b = interner::intern_sym("flag-b");
+        let flag_c = interner::intern_sym("flag-c");
+        let result_sym = interner::intern_sym("loop-result");
+
+        let bindings_vec = Vector::from_iter(vec![
+            symbol(flag_a),
+            bool_val(true),
+            symbol(flag_b),
+            bool_val(false),
+            symbol(flag_c),
+            bool_val(false),
+            symbol(result_sym),
+            int_val(0),
+        ]);
+
+        let bindings_value = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(bindings_vec),
+            meta: None,
+        };
+
+        let loop_body =
+            build_three_stage_recur_body(&eval, flag_a, flag_b, flag_c, result_sym);
+
+        let loop_form = make_special_form_list(
+            eval.core_syms.s_loop,
+            vec![bindings_value, loop_body],
+        );
+
+        let result = eval.eval(&loop_form, &mut env).unwrap();
+
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 1),
+            other => panic!("Expected Int(1), got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_eval_bool() {
         let (eval, mut env) = setup();
-        let form = Value::Bool { span: test_span(), value: true };
+        let form = Value::Bool { span: synthetic_span(), value: true };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::Bool { value, .. } => assert_eq!(value, true),
@@ -805,7 +997,7 @@ mod tests {
     #[test]
     fn test_eval_nil() {
         let (eval, mut env) = setup();
-        let form = Value::Nil { span: test_span() };
+        let form = Value::Nil { span: synthetic_span() };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::Nil { .. } => {}
@@ -817,7 +1009,7 @@ mod tests {
     fn test_eval_empty_list() {
         let (eval, mut env) = setup();
         let form = Value::List {
-            span: test_span(),
+            span: synthetic_span(),
             value: Arc::new(List::new()),
             meta: None,
         };
@@ -832,12 +1024,15 @@ mod tests {
     fn test_eval_vector() {
         let (eval, mut env) = setup();
         let vector = Vector::from_iter(vec![
-            Value::Int { span: test_span(), value: 1 },
-            Value::Int { span: test_span(), value: 2 },
-            Value::Int { span: test_span(), value: 3 },
+            Value::Int { span: synthetic_span(), value: 1 },
+            Value::Int { span: synthetic_span(), value: 2 },
+            Value::Int { span: synthetic_span(), value: 3 },
         ]);
-        let form =
-            Value::Vector { span: test_span(), value: Arc::new(vector), meta: None };
+        let form = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(vector),
+            meta: None,
+        };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::Vector { value, .. } => {
@@ -854,7 +1049,8 @@ mod tests {
     fn test_eval_native_function_symbol() {
         let (eval, mut env) = setup();
         let sym_id = interner::intern_sym("concat");
-        let form = Value::Symbol { span: test_span(), value: sym_id, meta: None };
+        let form =
+            Value::Symbol { span: synthetic_span(), value: sym_id, meta: None };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::NativeFunction { name, .. } => assert_eq!(name, sym_id),
@@ -870,18 +1066,25 @@ mod tests {
         let concat_sym = interner::intern_sym("concat");
 
         let mut list = List::new();
-        list =
-            list.prepend(Value::String { span: test_span(), value: Arc::from("b") });
-        list =
-            list.prepend(Value::String { span: test_span(), value: Arc::from("a") });
+        list = list.prepend(Value::String {
+            span: synthetic_span(),
+            value: Arc::from("b"),
+        });
+        list = list.prepend(Value::String {
+            span: synthetic_span(),
+            value: Arc::from("a"),
+        });
         list = list.prepend(Value::Symbol {
-            span: test_span(),
+            span: synthetic_span(),
             value: concat_sym,
             meta: None,
         });
 
-        let form =
-            Value::List { span: test_span(), value: Arc::new(list), meta: None };
+        let form = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(list),
+            meta: None,
+        };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::String { value, .. } => assert_eq!(value.as_ref(), "ab"),
@@ -897,7 +1100,8 @@ mod tests {
     fn test_eval_symbol_undefined() {
         let (eval, mut env) = setup();
         let sym_id = interner::intern_sym("undefined-var");
-        let form = Value::Symbol { span: test_span(), value: sym_id, meta: None };
+        let form =
+            Value::Symbol { span: synthetic_span(), value: sym_id, meta: None };
         let result = eval.eval(&form, &mut env);
         assert!(result.is_err());
         match result {
@@ -912,9 +1116,10 @@ mod tests {
     fn test_eval_symbol_defined() {
         let (eval, mut env) = setup();
         let sym_id = interner::intern_sym("x");
-        let value = Value::Int { span: test_span(), value: 42 };
+        let value = Value::Int { span: synthetic_span(), value: 42 };
         env = env.set(sym_id, value.clone());
-        let form = Value::Symbol { span: test_span(), value: sym_id, meta: None };
+        let form =
+            Value::Symbol { span: synthetic_span(), value: sym_id, meta: None };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
             Value::Int { value: v, .. } => assert_eq!(v, 42),
@@ -926,25 +1131,107 @@ mod tests {
     // Special Form Tests: quote
     //===----------------------------------------------------------------------===//
 
-    // Note: quote and other special form tests are skipped because the implementation
-    // appears to have bugs where handlers receive the full list but expect only arguments.
-    // The handlers use args.head() expecting the first argument, but receive the special form.
+    #[test]
+    fn test_eval_quote_returns_literal() {
+        let (eval, mut env) = setup();
+        let quoted = Value::Int { span: synthetic_span(), value: 42 };
+        let form =
+            make_special_form_list(eval.core_syms.s_quote, vec![quoted.clone()]);
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 42),
+            other => panic!("Expected Int(42), got {:?}", other),
+        }
+    }
 
     //===----------------------------------------------------------------------===//
     // Special Form Tests: if
     //===----------------------------------------------------------------------===//
 
-    // Note: if tests are simplified due to implementation issues where handlers
-    // receive full list but expect only arguments. Testing error case only.
+    #[test]
+    fn test_eval_if_truthy_branch() {
+        let (eval, mut env) = setup();
+        let form = make_special_form_list(
+            eval.core_syms.s_if,
+            vec![
+                bool_val(true),
+                int_val(42),
+                int_val(0),
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 42),
+            other => panic!("Expected Int(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_if_falsey_branch() {
+        let (eval, mut env) = setup();
+        let form = make_special_form_list(
+            eval.core_syms.s_if,
+            vec![
+                bool_val(false),
+                int_val(42),
+                int_val(7),
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 7),
+            other => panic!("Expected Int(7), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_if_without_else_returns_nil() {
+        let (eval, mut env) = setup();
+        let form = make_special_form_list(
+            eval.core_syms.s_if,
+            vec![
+                bool_val(false),
+                int_val(42),
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Nil { .. } => {}
+            other => panic!("Expected Nil, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_if_nil_condition_treated_as_false() {
+        let (eval, mut env) = setup();
+        let form = make_special_form_list(
+            eval.core_syms.s_if,
+            vec![
+                Value::Nil { span: synthetic_span() },
+                int_val(1),
+                int_val(2),
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 2),
+            other => panic!("Expected Int(2), got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_eval_if_wrong_args() {
         let (eval, mut env) = setup();
         // Empty list (just special form) should fail
         let form = Value::List {
-            span: test_span(),
+            span: synthetic_span(),
             value: Arc::new(List::new().prepend(Value::SpecialForm {
-                span: test_span(),
+                span: synthetic_span(),
                 name: eval.core_syms.s_if,
             })),
             meta: None,
@@ -956,18 +1243,15 @@ mod tests {
     //===----------------------------------------------------------------------===//
     // Special Form Tests: do
     //===----------------------------------------------------------------------===//
-
-    // Note: do empty test skipped due to implementation issue
-
     #[test]
     fn test_eval_do_returns_last() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
             eval.core_syms.s_do,
             vec![
-                Value::Int { span: test_span(), value: 1 },
-                Value::Int { span: test_span(), value: 2 },
-                Value::Int { span: test_span(), value: 3 },
+                Value::Int { span: synthetic_span(), value: 1 },
+                Value::Int { span: synthetic_span(), value: 2 },
+                Value::Int { span: synthetic_span(), value: 3 },
             ],
         );
         let result = eval.eval(&form, &mut env).unwrap();
@@ -977,37 +1261,242 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_eval_do_empty_returns_nil() {
+        let (eval, mut env) = setup();
+
+        let form = make_special_form_list(eval.core_syms.s_do, vec![]);
+        let result = eval.eval(&form, &mut env).unwrap();
+
+        match result {
+            Value::Nil { .. } => {}
+            other => panic!("Expected Nil, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_do_executes_side_effects_in_order() {
+        let (eval, mut env) = setup();
+        let flag_a = interner::intern_sym("do-flag-a");
+        let flag_b = interner::intern_sym("do-flag-b");
+
+        let set_flag_b = make_special_form_list(
+            eval.core_syms.s_let,
+            vec![
+                Value::Vector {
+                    span: synthetic_span(),
+                    value: Arc::new(Vector::from_iter(vec![
+                        symbol(flag_b),
+                        bool_val(true),
+                    ])),
+                    meta: None,
+                },
+                symbol(flag_b),
+            ],
+        );
+
+        let forms = vec![
+            make_special_form_list(
+                eval.core_syms.s_let,
+                vec![
+                    Value::Vector {
+                        span: synthetic_span(),
+                        value: Arc::new(Vector::from_iter(vec![
+                            symbol(flag_a),
+                            bool_val(true),
+                        ])),
+                        meta: None,
+                    },
+                    symbol(flag_a),
+                ],
+            ),
+            set_flag_b.clone(),
+            Value::Int { span: synthetic_span(), value: 5 },
+        ];
+
+        let form = make_special_form_list(eval.core_syms.s_do, forms);
+        let result = eval.eval(&form, &mut env).unwrap();
+
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 5),
+            other => panic!("Expected Int(5), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_do_will_restore_env_after_tail() {
+        let (eval, mut env) = setup();
+        let sym = interner::intern_sym("outer");
+        env = env.set(sym, int_val(1));
+
+        let inner_binding = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(Vector::from_iter(vec![symbol(sym), int_val(2)])),
+            meta: None,
+        };
+        let inner_form =
+            make_special_form_list(eval.core_syms.s_let, vec![inner_binding, symbol(sym)]);
+
+        let form = make_special_form_list(
+            eval.core_syms.s_do,
+            vec![inner_form, symbol(sym)],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 1),
+            other => panic!("Expected Int(1), got {:?}", other),
+        }
+    }
+
     //===----------------------------------------------------------------------===//
     // Special Form Tests: let
     //===----------------------------------------------------------------------===//
 
-    // Note: let test skipped due to implementation issue with special form handlers
+    #[test]
+    fn test_eval_let_binds_locals() {
+        let (eval, mut env) = setup();
+
+        let x_sym = interner::intern_sym("x");
+        let bindings_vec = Vector::from_iter(vec![symbol(x_sym), int_val(10)]);
+        let bindings_value = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(bindings_vec),
+            meta: None,
+        };
+
+        let body = symbol(x_sym);
+
+        let form = make_special_form_list(
+            eval.core_syms.s_let,
+            vec![bindings_value, body],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 10),
+            other => panic!("Expected Int(10), got {:?}", other),
+        }
+
+        assert!(env.get(x_sym).is_none(), "let should not leak bindings into parent env");
+    }
 
     //===----------------------------------------------------------------------===//
     // Special Form Tests: fn
     //===----------------------------------------------------------------------===//
 
-    // Note: fn test skipped due to implementation issue with special form handlers
+    #[test]
+    fn test_eval_fn_creates_function() {
+        let (eval, mut env) = setup();
+
+        let fn_name = interner::intern_sym("my-fn");
+        let param_sym = interner::intern_sym("x");
+
+        let params_vec = Vector::from_iter(vec![symbol(param_sym)]);
+        let params_value = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(params_vec),
+            meta: None,
+        };
+
+        let body_list = Arc::new(
+            List::new().prepend(symbol(param_sym))
+        );
+
+        let form = make_special_form_list(
+            eval.core_syms.s_fn,
+            vec![
+                symbol(fn_name),
+                params_value,
+                Value::List { span: synthetic_span(), value: body_list.clone(), meta: None },
+            ],
+        );
+
+        let result = eval.eval(&form, &mut env).unwrap();
+        match result {
+            Value::Function { name, params, body, .. } => {
+                assert_eq!(name, Some(fn_name));
+                assert_eq!(params.len(), 1);
+                match params.get(0).unwrap() {
+                    Value::Symbol { value, .. } => assert_eq!(*value, param_sym),
+                    other => panic!("Expected symbol param, got {:?}", other),
+                }
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("Expected Value::Function, got {:?}", other),
+        }
+    }
 
     //===----------------------------------------------------------------------===//
     // Function Application Tests
     //===----------------------------------------------------------------------===//
 
-    // Note: apply function test skipped - the apply function expects params to be
-    // convertible to strings, but the current implementation may have issues with this
-
     #[test]
-    fn test_apply_non_function() {
+    fn test_eval_function_application() {
         let (eval, mut env) = setup();
-        let not_a_func = Value::Int { span: test_span(), value: 42 };
-        let args = vec![Value::Int { span: test_span(), value: 1 }];
-        let result = eval.apply(&not_a_func, &args, &mut env);
-        assert!(result.is_err());
+
+        let param_sym = interner::intern_sym("apply-x");
+        let params_vec = Vector::from_iter(vec![symbol(param_sym)]);
+        let params_value = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(params_vec),
+            meta: None,
+        };
+
+        let body_form = symbol(param_sym);
+        let fn_form =
+            make_special_form_list(eval.core_syms.s_fn, vec![params_value, body_form]);
+
+        let mut invocation_list = List::new();
+        invocation_list = invocation_list.prepend(int_val(25));
+        invocation_list = invocation_list.prepend(fn_form);
+        let invocation = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(invocation_list),
+            meta: None,
+        };
+
+        let result = eval.eval(&invocation, &mut env).unwrap();
         match result {
-            Err(Error::TypeError { .. }) => {}
-            _ => panic!("Expected TypeError, got {:?}", result),
+            Value::Int { value, .. } => assert_eq!(value, 25),
+            other => panic!("Expected Int(25), got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_eval_function_application_wrong_arity() {
+        let (eval, mut env) = setup();
+
+        let param_sym = interner::intern_sym("apply-arity-x");
+        let params_vec = Vector::from_iter(vec![symbol(param_sym)]);
+        let params_value = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(params_vec),
+            meta: None,
+        };
+
+        let body_form = symbol(param_sym);
+        let fn_form =
+            make_special_form_list(eval.core_syms.s_fn, vec![params_value, body_form]);
+
+        let mut invocation_list = List::new();
+        invocation_list = invocation_list.prepend(fn_form);
+        let invocation = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(invocation_list),
+            meta: None,
+        };
+
+        let result = eval.eval(&invocation, &mut env);
+        assert!(result.is_err());
+        match result {
+            Err(Error::SyntaxError(SyntaxError::WrongArgumentCount { error_str })) => {
+                assert!(error_str.contains("Wrong number of arguments"));
+            }
+            other => panic!("Expected WrongArgumentCount error, got {:?}", other),
+        }
+    }
+
 
     //===----------------------------------------------------------------------===//
     // Environment Tests: create_child_with_bindings
@@ -1020,13 +1509,13 @@ mod tests {
         // Create bindings: [sym1 val1 sym2 val2]
         let sym1 = interner::intern_sym("x");
         let sym2 = interner::intern_sym("y");
-        let val1 = Value::Int { span: test_span(), value: 10 };
-        let val2 = Value::Int { span: test_span(), value: 20 };
+        let val1 = Value::Int { span: synthetic_span(), value: 10 };
+        let val2 = Value::Int { span: synthetic_span(), value: 20 };
 
         let bindings = Arc::new(Vector::from_iter(vec![
-            Value::Symbol { span: test_span(), value: sym1, meta: None },
+            Value::Symbol { span: synthetic_span(), value: sym1, meta: None },
             val1.clone(),
-            Value::Symbol { span: test_span(), value: sym2, meta: None },
+            Value::Symbol { span: synthetic_span(), value: sym2, meta: None },
             val2.clone(),
         ]));
 
@@ -1043,15 +1532,15 @@ mod tests {
 
         // Set a value in parent
         let parent_sym = interner::intern_sym("parent_var");
-        let parent_val = Value::Int { span: test_span(), value: 100 };
+        let parent_val = Value::Int { span: synthetic_span(), value: 100 };
         let env_with_parent = env.set(parent_sym, parent_val.clone());
 
         // Create child with new bindings
         let child_sym = interner::intern_sym("child_var");
-        let child_val = Value::Int { span: test_span(), value: 200 };
+        let child_val = Value::Int { span: synthetic_span(), value: 200 };
 
         let bindings = Arc::new(Vector::from_iter(vec![
-            Value::Symbol { span: test_span(), value: child_sym, meta: None },
+            Value::Symbol { span: synthetic_span(), value: child_sym, meta: None },
             child_val.clone(),
         ]));
 
@@ -1071,20 +1560,21 @@ mod tests {
         let y_sym = interner::intern_sym("y");
 
         let bindings_vec = Vector::from_iter(vec![
-            Value::Symbol { span: test_span(), value: x_sym, meta: None },
-            Value::Int { span: test_span(), value: 10 },
-            Value::Symbol { span: test_span(), value: y_sym, meta: None },
-            Value::Int { span: test_span(), value: 20 },
+            Value::Symbol { span: synthetic_span(), value: x_sym, meta: None },
+            Value::Int { span: synthetic_span(), value: 10 },
+            Value::Symbol { span: synthetic_span(), value: y_sym, meta: None },
+            Value::Int { span: synthetic_span(), value: 20 },
         ]);
 
         // Body is just the symbol x (not a list)
-        let body = Value::Symbol { span: test_span(), value: x_sym, meta: None };
+        let body =
+            Value::Symbol { span: synthetic_span(), value: x_sym, meta: None };
 
         let form = make_special_form_list(
             eval.core_syms.s_let,
             vec![
                 Value::Vector {
-                    span: test_span(),
+                    span: synthetic_span(),
                     value: Arc::new(bindings_vec),
                     meta: None,
                 },
@@ -1096,77 +1586,6 @@ mod tests {
         match result {
             Value::Int { value, .. } => assert_eq!(value, 10),
             _ => panic!("Expected Int(10), got {:?}", result),
-        }
-    }
-
-    #[test]
-    fn test_function_application_with_bindings() {
-        let (eval, mut env) = setup();
-
-        // Create a simple function: (fn [x] x)
-        let x_sym = interner::intern_sym("x");
-        let params = Arc::new(Vector::from_iter(vec![Value::Symbol {
-            span: test_span(),
-            value: x_sym,
-            meta: None,
-        }]));
-
-        let body = Arc::new(List::new().prepend(Value::Symbol {
-            span: test_span(),
-            value: x_sym,
-            meta: None,
-        }));
-
-        let func = Value::Function {
-            span: test_span(),
-            name: None,
-            params,
-            body,
-            env: Arc::new(env.clone()),
-        };
-
-        // Apply function with argument
-        let args = vec![Value::Int { span: test_span(), value: 42 }];
-        let result = eval.apply(&func, &args, &mut env).unwrap();
-
-        match result {
-            Value::Int { value, .. } => assert_eq!(value, 42),
-            _ => panic!("Expected Int(42), got {:?}", result),
-        }
-    }
-
-    #[test]
-    fn test_function_application_wrong_arg_count() {
-        let (eval, mut env) = setup();
-
-        // Create a function with 2 params
-        let x_sym = interner::intern_sym("x");
-        let y_sym = interner::intern_sym("y");
-        let params = Arc::new(Vector::from_iter(vec![
-            Value::Symbol { span: test_span(), value: x_sym, meta: None },
-            Value::Symbol { span: test_span(), value: y_sym, meta: None },
-        ]));
-
-        let body = Arc::new(
-            List::new().prepend(Value::Int { span: test_span(), value: 0 }),
-        );
-
-        let func = Value::Function {
-            span: test_span(),
-            name: None,
-            params,
-            body,
-            env: Arc::new(env.clone()),
-        };
-
-        // Apply with wrong number of arguments
-        let args = vec![Value::Int { span: test_span(), value: 1 }];
-        let result = eval.apply(&func, &args, &mut env);
-
-        assert!(result.is_err());
-        match result {
-            Err(Error::SyntaxError(SyntaxError::WrongArgumentCount { .. })) => {}
-            _ => panic!("Expected WrongArgumentCount error, got {:?}", result),
         }
     }
 
@@ -1191,7 +1610,7 @@ mod tests {
         ]);
 
         let bindings_value = Value::Vector {
-            span: test_span(),
+            span: synthetic_span(),
             value: Arc::new(bindings_vec),
             meta: None,
         };
@@ -1229,7 +1648,7 @@ mod tests {
         ]);
 
         let params_value = Value::Vector {
-            span: test_span(),
+            span: synthetic_span(),
             value: Arc::new(params_vec),
             meta: None,
         };
@@ -1242,12 +1661,105 @@ mod tests {
             vec![params_value, body_form],
         );
 
-        let function_value = eval.eval(&fn_form, &mut env).unwrap();
+        let mut invocation_list = List::new();
+        invocation_list = invocation_list.prepend(int_val(0));
+        invocation_list = invocation_list.prepend(bool_val(false));
+        invocation_list = invocation_list.prepend(bool_val(false));
+        invocation_list = invocation_list.prepend(bool_val(true));
+        invocation_list = invocation_list.prepend(fn_form);
+        let invocation = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(invocation_list),
+            meta: None,
+        };
 
-        let args =
-            vec![bool_val(true), bool_val(false), bool_val(false), int_val(0)];
+        let result = eval.eval(&invocation, &mut env).unwrap();
 
-        let result = eval.apply(&function_value, &args, &mut env).unwrap();
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 1),
+            other => panic!("Expected Int(1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_function_application() {
+        let (eval, mut env) = setup();
+
+        let param_sym = interner::intern_sym("x");
+
+        let params_vec = Vector::from_iter(vec![symbol(param_sym)]);
+        let params_value = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(params_vec),
+            meta: None,
+        };
+
+        let body_value = symbol(param_sym);
+        let fn_form = make_special_form_list(
+            eval.core_syms.s_fn,
+            vec![params_value, body_value],
+        );
+
+        let mut call_list = List::new();
+        call_list =
+            call_list.prepend(Value::Int { span: synthetic_span(), value: 42 });
+        call_list = call_list.prepend(fn_form);
+        let call_form = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(call_list),
+            meta: None,
+        };
+
+        let result = eval.eval(&call_form, &mut env).unwrap();
+
+        match result {
+            Value::Int { value, .. } => assert_eq!(value, 42),
+            other => panic!("Expected Int(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trampoline_fn_recur_tail_calls() {
+        let (eval, mut env) = setup();
+
+        let flag_a = interner::intern_sym("flag-a");
+        let flag_b = interner::intern_sym("flag-b");
+        let flag_c = interner::intern_sym("flag-c");
+        let result_sym = interner::intern_sym("fn-result");
+        let params_vec = Vector::from_iter(vec![
+            symbol(flag_a),
+            symbol(flag_b),
+            symbol(flag_c),
+            symbol(result_sym),
+        ]);
+
+        let params_value = Value::Vector {
+            span: synthetic_span(),
+            value: Arc::new(params_vec),
+            meta: None,
+        };
+
+        let body_form =
+            build_three_stage_recur_body(&eval, flag_a, flag_b, flag_c, result_sym);
+
+        let fn_form = make_special_form_list(
+            eval.core_syms.s_fn,
+            vec![params_value, body_form],
+        );
+
+        let mut call_list = List::new();
+        call_list = call_list.prepend(int_val(0));
+        call_list = call_list.prepend(bool_val(false));
+        call_list = call_list.prepend(bool_val(false));
+        call_list = call_list.prepend(bool_val(true));
+        call_list = call_list.prepend(fn_form);
+        let call_form = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(call_list),
+            meta: None,
+        };
+
+        let result = eval.eval(&call_form, &mut env).unwrap();
 
         match result {
             Value::Int { value, .. } => assert_eq!(value, 1),
