@@ -3,70 +3,11 @@ use std::{fmt, path, sync::Arc};
 
 use crate::collections::{List, Map, Set, Vector};
 use crate::error::{Diagnostic, Error, SyntaxError};
-use crate::interner;
-use crate::value::Value;
+use crate::interner::{self, SymId};
+use crate::runtime::{Runtime, RuntimeRef};
+use crate::value::{self, Value};
 
 pub type Span = logos::Span;
-
-//===----------------------------------------------------------------------===//
-// Utils
-//===----------------------------------------------------------------------===//
-
-/// Unescapes a single character from an escape sequence.
-/// Handles common escape sequences: \n, \t, \r, \", \\, and others.
-/// For unknown escape sequences, returns the character after the backslash.
-fn unescape_char(s: &str) -> char {
-    // The slice should be "\X" where X is the character after the backslash
-    if s.len() >= 2 && s.starts_with('\\') {
-        match s.chars().nth(1) {
-            Some('n') => '\n',
-            Some('t') => '\t',
-            Some('r') => '\r',
-            Some('"') => '"',
-            Some('\\') => '\\',
-            Some('0') => '\0',
-            Some(ch) => ch, // For unknown escape sequences, return the character itself
-            None => '\\',   // Shouldn't happen, but handle it
-        }
-    } else {
-        // Fallback: try to parse as-is (shouldn't happen with correct regex)
-        s.chars().next().unwrap_or('?')
-    }
-}
-
-/// Unescapes a string literal by converting escape sequences to their actual characters.
-/// Handles common escape sequences: \n, \t, \r, \", \\, and others.
-fn unescape_string(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next_ch) = chars.next() {
-                match next_ch {
-                    'n' => result.push('\n'),
-                    't' => result.push('\t'),
-                    'r' => result.push('\r'),
-                    '"' => result.push('"'),
-                    '\\' => result.push('\\'),
-                    '0' => result.push('\0'),
-                    _ => {
-                        // For unknown escape sequences, keep the backslash and character
-                        result.push('\\');
-                        result.push(next_ch);
-                    }
-                }
-            } else {
-                // Trailing backslash, keep it
-                result.push('\\');
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result
-}
 
 //===----------------------------------------------------------------------===//
 // Source
@@ -229,14 +170,6 @@ impl fmt::Display for Token {
 pub struct TokenCST {
     token: Token,
     span: Span,
-    source: Source,
-}
-
-#[derive(Debug)]
-pub struct Reader {
-    tokens: Vec<TokenCST>,
-    source: String,
-    position: usize,
     file: Source,
 }
 
@@ -248,16 +181,36 @@ enum CollType {
     Set,
 }
 
+#[derive(Debug)]
+pub struct Reader {
+    /// The tokens of the source code.
+    tokens: Vec<TokenCST>,
+    /// The source code string.
+    source: String,
+    /// The current position in the source code.
+    position: usize,
+    /// The file source of the source code, a file or the REPL.
+    file: Source,
+    /// A runtime instance reference.
+    runtime: Arc<Runtime>,
+    /// A syntax quote reader instance.
+    syntax_quote_reader: SyntaxQuoteReader,
+}
+
 impl Reader {
     /// Reads the source code transforming it into a Value.
-    pub fn read(source: &str, file: Source) -> Result<Value, Diagnostic> {
-        let mut reader = Self::tokenize(source, file);
+    pub fn read(
+        source: &str,
+        file: Source,
+        runtime: Arc<Runtime>,
+    ) -> Result<Value, Diagnostic> {
+        let mut reader = Self::tokenize(source, file, runtime);
         reader.read_form()
     }
 
     /// Transforms the source code into a vector of tokens,
     /// and returns a new Reader instance.
-    fn tokenize(source_code: &str, source_location: Source) -> Self {
+    fn tokenize(source_code: &str, file: Source, runtime: Arc<Runtime>) -> Self {
         let mut lexer = Token::lexer(source_code.trim());
         let mut tokens: Vec<TokenCST> = vec![];
 
@@ -270,7 +223,7 @@ impl Reader {
                 tokens.push(TokenCST {
                     token,
                     span: lexer.span(),
-                    source: source_location.clone(),
+                    file: file.clone(),
                 });
             }
         }
@@ -279,7 +232,9 @@ impl Reader {
             tokens,
             source: source_code.to_string(),
             position: 0,
-            file: source_location,
+            file: file,
+            runtime: runtime.clone(),
+            syntax_quote_reader: SyntaxQuoteReader::new(runtime),
         }
     }
 
@@ -498,7 +453,7 @@ impl Reader {
         self.tokens[symbol_index] = TokenCST {
             token: Token::Underscore,
             span: Span { start: symbol_token.span.start, end: rest_offset },
-            source: symbol_token.source.clone(),
+            file: symbol_token.file.clone(),
         };
 
         let rest = &symbol_str[1..];
@@ -521,7 +476,7 @@ impl Reader {
                         start: rest_offset + rest_span.start,
                         end: rest_offset + rest_span.end,
                     },
-                    source: symbol_token.source.clone(),
+                    file: symbol_token.file.clone(),
                 });
             }
         }
@@ -562,7 +517,7 @@ impl Reader {
                     value: Arc::new(List::from_iter(vec![
                         Value::Symbol {
                             span: backtick_span.clone(),
-                            value: interner::intern_sym("quasiquote"),
+                            value: interner::intern_sym("syntax-quote"),
                             meta: None,
                         },
                         self.read_form()?,
@@ -698,115 +653,219 @@ impl Reader {
     }
 }
 
+//===----------------------------------------------------------------------===//
+// SyntaxQuoteReader
+//===----------------------------------------------------------------------===//
+
+#[derive(Debug)]
+struct SyntaxQuoteReader {
+    gensyms: Map<SymId, SymId>,
+    runtime: RuntimeRef,
+}
+
+impl SyntaxQuoteReader {
+    fn new(runtime: RuntimeRef) -> Self {
+        Self { gensyms: Map::new(), runtime }
+    }
+
+    pub fn syntax_quote(&self, form: &Value) -> Value {
+        match form {
+            Value::Symbol { span, value, meta } => {
+                if self.runtime.evaluator.is_special_form(*value) {
+                    return value::list(
+                        span.clone(),
+                        vec![
+                            value::symbol(
+                                span.clone(),
+                                interner::intern_sym("quote"),
+                                None,
+                            ),
+                            value::symbol(span.clone(), *value, meta.clone()),
+                        ],
+                    );
+                }
+
+                form.clone()
+            }
+            _ => form.clone(),
+        }
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// Utils
+//===----------------------------------------------------------------------===//
+
+/// Unescapes a single character from an escape sequence.
+/// Handles common escape sequences: \n, \t, \r, \", \\, and others.
+/// For unknown escape sequences, returns the character after the backslash.
+fn unescape_char(s: &str) -> char {
+    // The slice should be "\X" where X is the character after the backslash
+    if s.len() >= 2 && s.starts_with('\\') {
+        match s.chars().nth(1) {
+            Some('n') => '\n',
+            Some('t') => '\t',
+            Some('r') => '\r',
+            Some('"') => '"',
+            Some('\\') => '\\',
+            Some('0') => '\0',
+            Some(ch) => ch, // For unknown escape sequences, return the character itself
+            None => '\\',   // Shouldn't happen, but handle it
+        }
+    } else {
+        // Fallback: try to parse as-is (shouldn't happen with correct regex)
+        s.chars().next().unwrap_or('?')
+    }
+}
+
+/// Unescapes a string literal by converting escape sequences to their actual characters.
+/// Handles common escape sequences: \n, \t, \r, \", \\, and others.
+fn unescape_string(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next_ch) = chars.next() {
+                match next_ch {
+                    'n' => result.push('\n'),
+                    't' => result.push('\t'),
+                    'r' => result.push('\r'),
+                    '"' => result.push('"'),
+                    '\\' => result.push('\\'),
+                    '0' => result.push('\0'),
+                    _ => {
+                        // For unknown escape sequences, keep the backslash and character
+                        result.push('\\');
+                        result.push(next_ch);
+                    }
+                }
+            } else {
+                // Trailing backslash, keep it
+                result.push('\\');
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup() -> Arc<Runtime> {
+        Runtime::new()
+    }
 
     #[test]
     fn tokenizes_core_cases() {
         let src: &str = r#"(def x 123 -45.6 "hi\n\"there\"" ; comment
                       ~@ [a b] {k v} 'sym `q ^m @n #t _ ~ sym-1 \a)"#;
 
-        let toks: Vec<TokenCST> = Reader::tokenize(src, Source::REPL).tokens;
+        let toks: Vec<TokenCST> =
+            Reader::tokenize(src, Source::REPL, setup()).tokens;
 
         // Smoke-check presence/order of a few key tokens:
         assert!(toks.starts_with(&[TokenCST {
             token: Token::LParen,
             span: Span { start: 0, end: 1 },
-            source: Source::REPL,
+            file: Source::REPL,
         }]));
         assert!(toks.contains(&TokenCST {
             token: Token::Int(123),
             span: Span { start: 7, end: 10 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Float(-45.6),
             span: Span { start: 11, end: 16 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Str("hi\n\"there\"".to_string()),
             span: Span { start: 17, end: 32 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::TildeAt,
             span: Span { start: 65, end: 67 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::LBracket,
             span: Span { start: 68, end: 69 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::LBrace,
             span: Span { start: 74, end: 75 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Quote,
             span: Span { start: 80, end: 81 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Backtick,
             span: Span { start: 85, end: 86 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Caret,
             span: Span { start: 88, end: 89 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::At,
             span: Span { start: 91, end: 92 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Hash,
             span: Span { start: 94, end: 95 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Underscore,
             span: Span { start: 97, end: 98 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Tilde,
             span: Span { start: 99, end: 100 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Symbol("sym-1".to_string()),
             span: Span { start: 101, end: 106 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::Char('a'),
             span: Span { start: 107, end: 109 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
         assert!(toks.contains(&TokenCST {
             token: Token::RParen,
             span: Span { start: 109, end: 110 },
-            source: Source::REPL,
+            file: Source::REPL,
         }));
     }
 
     #[test]
     fn unterminated_string_is_flagged() {
         let src = r#""oops"#;
-        let v: Vec<_> = Reader::tokenize(src, Source::REPL).tokens;
+        let v: Vec<_> = Reader::tokenize(src, Source::REPL, setup()).tokens;
         assert_eq!(
             v,
             vec![TokenCST {
                 token: Token::UnterminatedStr("\"oops".to_string()),
                 span: Span { start: 0, end: 5 },
-                source: Source::REPL,
+                file: Source::REPL,
             }]
         );
     }
@@ -817,7 +876,7 @@ mod tests {
 
     #[test]
     fn reads_symbols() {
-        let result = Reader::read("my-symbol", Source::REPL).unwrap();
+        let result = Reader::read("my-symbol", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
                 assert_eq!(interner::sym_to_str(value), "my-symbol");
@@ -828,7 +887,7 @@ mod tests {
 
     #[test]
     fn reads_keywords() {
-        let result = Reader::read(":keyword", Source::REPL).unwrap();
+        let result = Reader::read(":keyword", Source::REPL, setup()).unwrap();
         match result {
             Value::Keyword { value, .. } => {
                 assert_eq!(interner::kw_print(value), ":keyword");
@@ -839,13 +898,13 @@ mod tests {
 
     #[test]
     fn reads_integers() {
-        let result = Reader::read("42", Source::REPL).unwrap();
+        let result = Reader::read("42", Source::REPL, setup()).unwrap();
         match result {
             Value::Int { value, .. } => assert_eq!(value, 42),
             _ => panic!("Expected Int, got {:?}", result),
         }
 
-        let result = Reader::read("-123", Source::REPL).unwrap();
+        let result = Reader::read("-123", Source::REPL, setup()).unwrap();
         match result {
             Value::Int { value, .. } => assert_eq!(value, -123),
             _ => panic!("Expected Int, got {:?}", result),
@@ -854,7 +913,7 @@ mod tests {
 
     #[test]
     fn reads_floats() {
-        let result = Reader::read("3.14", Source::REPL).unwrap();
+        let result = Reader::read("3.14", Source::REPL, setup()).unwrap();
         match result {
             Value::Float { value, .. } => {
                 assert!((value - 3.14).abs() < f64::EPSILON)
@@ -862,7 +921,7 @@ mod tests {
             _ => panic!("Expected Float, got {:?}", result),
         }
 
-        let result = Reader::read("-0.5", Source::REPL).unwrap();
+        let result = Reader::read("-0.5", Source::REPL, setup()).unwrap();
         match result {
             Value::Float { value, .. } => {
                 assert!((value - -0.5).abs() < f64::EPSILON)
@@ -873,7 +932,7 @@ mod tests {
 
     #[test]
     fn reads_strings() {
-        let result = Reader::read(r#""hello""#, Source::REPL).unwrap();
+        let result = Reader::read(r#""hello""#, Source::REPL, setup()).unwrap();
         match result {
             Value::String { value, .. } => assert_eq!(value, Arc::from("hello")),
             _ => panic!("Expected String, got {:?}", result),
@@ -882,7 +941,8 @@ mod tests {
 
     #[test]
     fn reads_strings_with_escapes() {
-        let result = Reader::read(r#""hello\nworld""#, Source::REPL).unwrap();
+        let result =
+            Reader::read(r#""hello\nworld""#, Source::REPL, setup()).unwrap();
         match result {
             Value::String { value, .. } => {
                 assert_eq!(value, Arc::from("hello\nworld"))
@@ -890,13 +950,14 @@ mod tests {
             _ => panic!("Expected String, got {:?}", result),
         }
 
-        let result = Reader::read(r#""tab\there""#, Source::REPL).unwrap();
+        let result = Reader::read(r#""tab\there""#, Source::REPL, setup()).unwrap();
         match result {
             Value::String { value, .. } => assert_eq!(value, Arc::from("tab\there")),
             _ => panic!("Expected String, got {:?}", result),
         }
 
-        let result = Reader::read(r#""quote\"here""#, Source::REPL).unwrap();
+        let result =
+            Reader::read(r#""quote\"here""#, Source::REPL, setup()).unwrap();
         match result {
             Value::String { value, .. } => {
                 assert_eq!(value, Arc::from("quote\"here"))
@@ -904,7 +965,8 @@ mod tests {
             _ => panic!("Expected String, got {:?}", result),
         }
 
-        let result = Reader::read(r#""backslash\\here""#, Source::REPL).unwrap();
+        let result =
+            Reader::read(r#""backslash\\here""#, Source::REPL, setup()).unwrap();
         match result {
             Value::String { value, .. } => {
                 assert_eq!(value, Arc::from("backslash\\here"))
@@ -915,19 +977,19 @@ mod tests {
 
     #[test]
     fn reads_characters() {
-        let result = Reader::read(r"\a", Source::REPL).unwrap();
+        let result = Reader::read(r"\a", Source::REPL, setup()).unwrap();
         match result {
             Value::Char { value, .. } => assert_eq!(value, 'a'),
             _ => panic!("Expected Char, got {:?}", result),
         }
 
-        let result = Reader::read(r"\n", Source::REPL).unwrap();
+        let result = Reader::read(r"\n", Source::REPL, setup()).unwrap();
         match result {
             Value::Char { value, .. } => assert_eq!(value, '\n'),
             _ => panic!("Expected Char, got {:?}", result),
         }
 
-        let result = Reader::read(r"\t", Source::REPL).unwrap();
+        let result = Reader::read(r"\t", Source::REPL, setup()).unwrap();
         match result {
             Value::Char { value, .. } => assert_eq!(value, '\t'),
             _ => panic!("Expected Char, got {:?}", result),
@@ -936,13 +998,13 @@ mod tests {
 
     #[test]
     fn reads_booleans() {
-        let result = Reader::read("true", Source::REPL).unwrap();
+        let result = Reader::read("true", Source::REPL, setup()).unwrap();
         match result {
             Value::Bool { value, .. } => assert_eq!(value, true),
             _ => panic!("Expected Bool(true), got {:?}", result),
         }
 
-        let result = Reader::read("false", Source::REPL).unwrap();
+        let result = Reader::read("false", Source::REPL, setup()).unwrap();
         match result {
             Value::Bool { value, .. } => assert_eq!(value, false),
             _ => panic!("Expected Bool(false), got {:?}", result),
@@ -951,7 +1013,7 @@ mod tests {
 
     #[test]
     fn reads_nil() {
-        let result = Reader::read("nil", Source::REPL).unwrap();
+        let result = Reader::read("nil", Source::REPL, setup()).unwrap();
         match result {
             Value::Nil { .. } => {}
             _ => panic!("Expected Nil, got {:?}", result),
@@ -960,7 +1022,7 @@ mod tests {
 
     #[test]
     fn unterminated_string_returns_error() {
-        let result = Reader::read(r#""unterminated"#, Source::REPL);
+        let result = Reader::read(r#""unterminated"#, Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -980,7 +1042,7 @@ mod tests {
 
     #[test]
     fn reads_empty_list() {
-        let result = Reader::read("()", Source::REPL).unwrap();
+        let result = Reader::read("()", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => assert_eq!(value.len(), 0),
             _ => panic!("Expected empty List, got {:?}", result),
@@ -989,7 +1051,7 @@ mod tests {
 
     #[test]
     fn reads_list_with_elements() {
-        let result = Reader::read("(1 2 3)", Source::REPL).unwrap();
+        let result = Reader::read("(1 2 3)", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 3);
@@ -1013,7 +1075,7 @@ mod tests {
 
     #[test]
     fn reads_nested_lists() {
-        let result = Reader::read("(1 (2 3) 4)", Source::REPL).unwrap();
+        let result = Reader::read("(1 (2 3) 4)", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 3);
@@ -1040,7 +1102,7 @@ mod tests {
 
     #[test]
     fn reads_empty_vector() {
-        let result = Reader::read("[]", Source::REPL).unwrap();
+        let result = Reader::read("[]", Source::REPL, setup()).unwrap();
         match result {
             Value::Vector { value, .. } => assert_eq!(value.len(), 0),
             _ => panic!("Expected empty Vector, got {:?}", result),
@@ -1049,7 +1111,7 @@ mod tests {
 
     #[test]
     fn reads_vector_with_elements() {
-        let result = Reader::read("[a b c]", Source::REPL).unwrap();
+        let result = Reader::read("[a b c]", Source::REPL, setup()).unwrap();
         match result {
             Value::Vector { value, .. } => {
                 assert_eq!(value.len(), 3);
@@ -1066,7 +1128,7 @@ mod tests {
 
     #[test]
     fn reads_empty_map() {
-        let result = Reader::read("{}", Source::REPL).unwrap();
+        let result = Reader::read("{}", Source::REPL, setup()).unwrap();
         match result {
             Value::Map { value, .. } => assert_eq!(value.len(), 0),
             _ => panic!("Expected empty Map, got {:?}", result),
@@ -1075,7 +1137,7 @@ mod tests {
 
     #[test]
     fn reads_map_with_key_value_pairs() {
-        let result = Reader::read("{:a 1 :b 2}", Source::REPL).unwrap();
+        let result = Reader::read("{:a 1 :b 2}", Source::REPL, setup()).unwrap();
         match result {
             Value::Map { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1097,7 +1159,7 @@ mod tests {
 
     #[test]
     fn reads_empty_set() {
-        let result = Reader::read("#{}", Source::REPL).unwrap();
+        let result = Reader::read("#{}", Source::REPL, setup()).unwrap();
         match result {
             Value::Set { value, .. } => assert_eq!(value.len(), 0),
             _ => panic!("Expected empty Set, got {:?}", result),
@@ -1106,7 +1168,7 @@ mod tests {
 
     #[test]
     fn reads_set_with_elements() {
-        let result = Reader::read("#{1 2 3}", Source::REPL).unwrap();
+        let result = Reader::read("#{1 2 3}", Source::REPL, setup()).unwrap();
         match result {
             Value::Set { value, .. } => {
                 assert_eq!(value.len(), 3);
@@ -1127,7 +1189,7 @@ mod tests {
 
     #[test]
     fn reads_quote() {
-        let result = Reader::read("'symbol", Source::REPL).unwrap();
+        let result = Reader::read("'symbol", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1149,25 +1211,25 @@ mod tests {
 
     #[test]
     fn reads_backtick() {
-        let result = Reader::read("`symbol", Source::REPL).unwrap();
+        let result = Reader::read("`symbol", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 2);
                 let items: Vec<_> = value.iter().collect();
                 match items[0] {
                     Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "quasiquote");
+                        assert_eq!(interner::sym_to_str(*v), "syntax-quote");
                     }
-                    _ => panic!("Expected quasiquote symbol"),
+                    _ => panic!("Expected syntax-quote symbol"),
                 }
             }
-            _ => panic!("Expected List (quasiquote form), got {:?}", result),
+            _ => panic!("Expected List (syntax-quote form), got {:?}", result),
         }
     }
 
     #[test]
     fn reads_tilde() {
-        let result = Reader::read("~symbol", Source::REPL).unwrap();
+        let result = Reader::read("~symbol", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1185,7 +1247,7 @@ mod tests {
 
     #[test]
     fn reads_tilde_at() {
-        let result = Reader::read("~@symbol", Source::REPL).unwrap();
+        let result = Reader::read("~@symbol", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1203,7 +1265,7 @@ mod tests {
 
     #[test]
     fn reads_var_quote() {
-        let result = Reader::read("#'symbol", Source::REPL).unwrap();
+        let result = Reader::read("#'symbol", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1222,7 +1284,8 @@ mod tests {
     #[test]
     fn reads_hash_underscore_discard() {
         // #_ should discard the next form and return the one after
-        let result = Reader::read("#_discard-me keep-me", Source::REPL).unwrap();
+        let result =
+            Reader::read("#_discard-me keep-me", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
                 assert_eq!(interner::sym_to_str(value), "keep-me");
@@ -1230,7 +1293,8 @@ mod tests {
             _ => panic!("Expected Symbol(keep-me), got {:?}", result),
         }
 
-        let vector_with_space = Reader::read("[1 #_ 2 3]", Source::REPL).unwrap();
+        let vector_with_space =
+            Reader::read("[1 #_ 2 3]", Source::REPL, setup()).unwrap();
         match vector_with_space {
             Value::Vector { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1246,7 +1310,8 @@ mod tests {
             other => panic!("Expected Vector, got {:?}", other),
         }
 
-        let vector_without_space = Reader::read("[1 #_2 3]", Source::REPL).unwrap();
+        let vector_without_space =
+            Reader::read("[1 #_2 3]", Source::REPL, setup()).unwrap();
         match vector_without_space {
             Value::Vector { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1271,7 +1336,7 @@ mod tests {
     // in error reporting before this test can pass.
     #[test]
     fn unbalanced_list_returns_error() {
-        let result = Reader::read("(1 2 3", Source::REPL);
+        let result = Reader::read("(1 2 3", Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -1292,7 +1357,7 @@ mod tests {
 
     #[test]
     fn unbalanced_vector_returns_error() {
-        let result = Reader::read("[1 2 3", Source::REPL);
+        let result = Reader::read("[1 2 3", Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -1313,7 +1378,7 @@ mod tests {
 
     #[test]
     fn unbalanced_map_returns_error() {
-        let result = Reader::read("{:a 1", Source::REPL);
+        let result = Reader::read("{:a 1", Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -1335,7 +1400,7 @@ mod tests {
     #[test]
     fn map_with_odd_number_of_forms_returns_error() {
         // Test with 1 element (odd)
-        let result = Reader::read("{:a}", Source::REPL);
+        let result = Reader::read("{:a}", Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -1348,7 +1413,7 @@ mod tests {
         }
 
         // Test with 3 elements (odd)
-        let result = Reader::read("{:a 1 :b}", Source::REPL);
+        let result = Reader::read("{:a 1 :b}", Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -1363,7 +1428,7 @@ mod tests {
 
     #[test]
     fn unexpected_eof_returns_error() {
-        let result = Reader::read("", Source::REPL);
+        let result = Reader::read("", Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -1379,7 +1444,7 @@ mod tests {
 
     #[test]
     fn unexpected_eof_in_quote_returns_error() {
-        let result = Reader::read("'", Source::REPL);
+        let result = Reader::read("'", Source::REPL, setup());
         assert!(result.is_err());
         match result {
             Err(diagnostic) => match diagnostic.error {
@@ -1399,7 +1464,8 @@ mod tests {
 
     #[test]
     fn reads_complex_nested_structure() {
-        let result = Reader::read("(defn add [x y] (+ x y))", Source::REPL).unwrap();
+        let result =
+            Reader::read("(defn add [x y] (+ x y))", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 4);
@@ -1425,7 +1491,7 @@ mod tests {
 
     #[test]
     fn reads_quoted_list() {
-        let result = Reader::read("'(1 2 3)", Source::REPL).unwrap();
+        let result = Reader::read("'(1 2 3)", Source::REPL, setup()).unwrap();
         match result {
             Value::List { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1449,9 +1515,12 @@ mod tests {
 
     #[test]
     fn reads_map_with_nested_structures() {
-        let result =
-            Reader::read("{:nested {:a 1 :b 2} :list [1 2 3]}", Source::REPL)
-                .unwrap();
+        let result = Reader::read(
+            "{:nested {:a 1 :b 2} :list [1 2 3]}",
+            Source::REPL,
+            setup(),
+        )
+        .unwrap();
         match result {
             Value::Map { value, .. } => {
                 assert_eq!(value.len(), 2);
@@ -1464,7 +1533,7 @@ mod tests {
     #[test]
     fn reads_multiple_forms_with_whitespace() {
         // Note: Reader::read only reads one form, so this should read just the first
-        let result = Reader::read("  42  ", Source::REPL).unwrap();
+        let result = Reader::read("  42  ", Source::REPL, setup()).unwrap();
         match result {
             Value::Int { value, .. } => assert_eq!(value, 42),
             _ => panic!("Expected Int(42), got {:?}", result),
@@ -1473,7 +1542,8 @@ mod tests {
 
     #[test]
     fn reads_symbols_with_special_chars() {
-        let result = Reader::read("symbol-with-dashes", Source::REPL).unwrap();
+        let result =
+            Reader::read("symbol-with-dashes", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
                 assert_eq!(interner::sym_to_str(value), "symbol-with-dashes");
@@ -1481,7 +1551,8 @@ mod tests {
             _ => panic!("Expected Symbol, got {:?}", result),
         }
 
-        let result = Reader::read("symbol_with_underscores", Source::REPL).unwrap();
+        let result =
+            Reader::read("symbol_with_underscores", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
                 assert_eq!(interner::sym_to_str(value), "symbol_with_underscores");
@@ -1492,7 +1563,7 @@ mod tests {
 
     #[test]
     fn reads_keywords_with_namespace() {
-        let result = Reader::read(":ns/keyword", Source::REPL).unwrap();
+        let result = Reader::read(":ns/keyword", Source::REPL, setup()).unwrap();
         match result {
             Value::Keyword { value, .. } => {
                 assert_eq!(interner::kw_print(value), ":ns/keyword");

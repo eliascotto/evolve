@@ -1,40 +1,13 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::collections::{List, Vector};
 use crate::core::native_fns::NativeRegistry;
-use crate::core::{RecurContext, Var};
+use crate::core::{Metadata, RecurContext, SpecialFormRegistry, Var};
 use crate::env::Env;
 use crate::error::{Error, SyntaxError};
 use crate::interner::{self, SymId};
 use crate::reader::Span;
 use crate::value::Value;
-
-pub struct CoreSyms {
-    pub s_def: SymId,
-    pub s_if: SymId,
-    pub s_let: SymId,
-    pub s_do: SymId,
-    pub s_quote: SymId,
-    pub s_fn: SymId,
-    pub s_loop: SymId,
-    pub s_recur: SymId,
-}
-
-impl CoreSyms {
-    pub fn new() -> Self {
-        Self {
-            s_def: interner::intern_sym("def"),
-            s_if: interner::intern_sym("if"),
-            s_let: interner::intern_sym("let*"),
-            s_do: interner::intern_sym("do"),
-            s_quote: interner::intern_sym("quote"),
-            s_fn: interner::intern_sym("fn*"),
-            s_loop: interner::intern_sym("loop*"),
-            s_recur: interner::intern_sym("recur"),
-        }
-    }
-}
 
 /// Result of executing a single trampoline step.
 enum Step {
@@ -53,8 +26,9 @@ enum Step {
 
 /// A trampoline interpreter that shares infrastructure with the legacy
 /// recursive evaluator but keeps evaluation inside an explicit loop.
+#[derive(Debug, Clone)]
 pub struct Evaluator {
-    core_syms: Arc<CoreSyms>,
+    pub special_forms: Arc<SpecialFormRegistry>,
     native_fns: Arc<NativeRegistry>,
 }
 
@@ -62,17 +36,16 @@ impl Evaluator {
     /// Create a new trampoline engine backed by the shared core symbols and
     /// native function registry.
     pub fn new() -> Self {
-        let core_syms = Arc::new(CoreSyms::new());
+        let core_syms = Arc::new(SpecialFormRegistry::new());
         let native_fns = Arc::new(NativeRegistry::new());
 
-        Self { core_syms, native_fns }
+        Self { special_forms: core_syms, native_fns }
     }
 
     /// Evaluate a form using the trampoline loop.
     ///
-    /// The method mirrors `Evaluator::eval` but never relies on the Rust call
-    /// stack for tail position.  Instead it accumulates the next form to
-    /// evaluate and iterates until a value is produced.
+    /// The method never relies on the Rust call stack for tail position.  
+    /// Instead it accumulates the next form to evaluate and iterates until a value is produced.
     pub fn eval(&self, form: &Value, env: &mut Env) -> Result<Value, Error> {
         let mut current_form = form.clone();
         let mut current_env = env.clone();
@@ -116,7 +89,7 @@ impl Evaluator {
                             }
                         }
 
-                        current_form = self.make_do_value(body.clone());
+                        current_form = make_do_value(self, body.clone());
                         current_env = next_env;
                     }
                     RecurContext::Function { params, body } => {
@@ -138,7 +111,7 @@ impl Evaluator {
                             }
                         }
 
-                        current_form = self.make_do_value(body.clone());
+                        current_form = make_do_value(self, body.clone());
                         current_env = next_env;
                     }
                 },
@@ -207,22 +180,45 @@ impl Evaluator {
         mut env: Env,
     ) -> Result<Step, Error> {
         if list.is_empty() {
-            return Ok(Step::Value(Value::Nil { span }, env));
+            // Empty list evalue to itself
+            return Ok(Step::Value(
+                Value::List { span, value: list, meta: None },
+                env,
+            ));
         }
 
         let head = list.head().unwrap().clone();
         let args = list.tail().unwrap_or_else(List::new);
 
+        // Resolve the macro variable or symbol
+        let maybe_macro_var = match &head {
+            // A list constructed programmatically can contain a var pointer to a macro
+            Value::Var { value: var, .. } => Some(var.clone()),
+            // Normal macro call receives a symbol
+            Value::Symbol { value: sym, .. } => env.ns.get(*sym).cloned(),
+            _ => None,
+        };
+
+        // Handle macro expansion before function evaluation
+        if let Some(var) = maybe_macro_var {
+            if var.is_macro() {
+                return self.expand_macro(var, args, env);
+            }
+        }
+
         let func = self.eval(&head, &mut env)?;
         match func {
+            // Special form
             Value::SpecialForm { name: sym, .. } => {
                 self.eval_special_form(sym, args, env)
             }
+            // Native function
             Value::NativeFunction { f, .. } => {
                 let evaluated_args = self.collect_args(&args, &mut env)?;
                 let result = f(&evaluated_args, &mut env)?;
                 Ok(Step::Value(result, env))
             }
+            // Ordinary function call
             Value::Function { params, body, env: fn_env, .. } => {
                 let evaluated_args = self.collect_args(&args, &mut env)?;
                 if params.len() != evaluated_args.len() {
@@ -249,7 +245,7 @@ impl Evaluator {
                         params: params.clone(),
                         body: body.clone(),
                     });
-                let body_form = self.make_do_value(body.clone());
+                let body_form = make_do_value(self, body.clone());
                 Ok(Step::Tail { form: body_form, env: call_env, restore: Some(env) })
             }
             other => Err(Error::TypeError {
@@ -257,6 +253,68 @@ impl Evaluator {
                 actual: other.as_str().to_string(),
             }),
         }
+    }
+
+    fn expand_macro(
+        &self,
+        macro_var: Arc<Var>,
+        args: List<Value>,
+        env: Env,
+    ) -> Result<Step, Error> {
+        // Resolve the macro function stored in the var
+        let macro_name = interner::sym_to_str(macro_var.symbol);
+        let storage = macro_var.value.as_ref().ok_or_else(|| {
+            Error::RuntimeError(format!("Macro '{}' is unbound", macro_name))
+        })?;
+
+        let macro_value = storage.read().map_err(|_| {
+            Error::RuntimeError(format!(
+                "Failed to read macro binding for '{}'",
+                macro_name
+            ))
+        })?;
+        // Clone the value then drop the original so the lock is released before the macro expansion continues.
+        let macro_fn = macro_value.clone();
+        drop(macro_value);
+
+        let (params, body, macro_env) = match macro_fn {
+            Value::Function { params, body, env: fn_env, .. } => {
+                (params, body, fn_env)
+            }
+            other => {
+                return Err(Error::TypeError {
+                    expected: "function".to_string(),
+                    actual: other.as_str().to_string(),
+                });
+            }
+        };
+
+        // Bind macro parameters to the raw argument forms
+        let provided_args: Vec<Value> = args.iter().cloned().collect();
+        if params.len() != provided_args.len() {
+            return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                error_str: format!(
+                    "Wrong number of arguments to macro. Expected {}, got {}",
+                    params.len(),
+                    provided_args.len()
+                ),
+            }));
+        }
+
+        let mut binding_pairs = Vec::with_capacity(provided_args.len() * 2);
+        for (param, arg_form) in params.iter().zip(provided_args.iter()) {
+            binding_pairs.push(param.clone());
+            binding_pairs.push(arg_form.clone());
+        }
+        let bindings = Arc::new(Vector::from_iter(binding_pairs));
+        let mut macro_scope_env = macro_env.create_child_with_bindings(bindings);
+
+        // Evaluate the macro body to produce the expansion form
+        let expansion_form = make_do_value(self, body.clone());
+        let expanded = self.eval(&expansion_form, &mut macro_scope_env)?;
+
+        // Evaluate the expanded form in place of the original call
+        return Ok(Step::Tail { form: expanded, env, restore: None });
     }
 
     fn collect_args(
@@ -273,28 +331,31 @@ impl Evaluator {
         args: List<Value>,
         env: Env,
     ) -> Result<Step, Error> {
-        if sym == self.core_syms.s_def {
+        if sym == self.special_forms.s_def {
             return self.eval_def(args, env);
         }
-        if sym == self.core_syms.s_if {
+        if sym == self.special_forms.s_defmacro {
+            return self.eval_defmacro(args, env);
+        }
+        if sym == self.special_forms.s_if {
             return self.eval_if(args, env);
         }
-        if sym == self.core_syms.s_let {
+        if sym == self.special_forms.s_let {
             return self.eval_let(args, env);
         }
-        if sym == self.core_syms.s_do {
+        if sym == self.special_forms.s_do {
             return self.eval_do(args, env);
         }
-        if sym == self.core_syms.s_quote {
+        if sym == self.special_forms.s_quote {
             return self.eval_quote(args, env);
         }
-        if sym == self.core_syms.s_loop {
+        if sym == self.special_forms.s_loop {
             return self.eval_loop(args, env);
         }
-        if sym == self.core_syms.s_recur {
+        if sym == self.special_forms.s_recur {
             return self.eval_recur(args, env);
         }
-        if sym == self.core_syms.s_fn {
+        if sym == self.special_forms.s_fn {
             return self.eval_fn(args, env);
         }
 
@@ -308,6 +369,7 @@ impl Evaluator {
             }));
         }
 
+        // (def symbol doc-string? init?)
         let mut iter = args.iter();
         let symbol_value = iter.next().ok_or_else(|| {
             Error::SyntaxError(SyntaxError::WrongArgumentCount {
@@ -352,16 +414,19 @@ impl Evaluator {
         };
 
         if let Some(doc) = docstring {
-            let doc_kw = interner::intern_kw("doc");
+            let doc_key = Value::Keyword {
+                span: synthetic_span(),
+                value: interner::intern_kw("doc"),
+            };
             let doc_value =
                 Value::String { span: synthetic_span(), value: Arc::from(doc) };
 
             match sym_meta.as_mut() {
                 Some(meta) => {
-                    meta.insert(doc_kw, doc_value);
+                    meta.insert(doc_key.clone(), doc_value.clone());
                 }
                 None => {
-                    sym_meta = Some(BTreeMap::from([(doc_kw, doc_value)]));
+                    sym_meta = Some(Metadata::from([(doc_key, doc_value)]));
                 }
             }
         }
@@ -381,6 +446,107 @@ impl Evaluator {
 
         let new_env = value_env.insert_ns(sym, var_arc);
         Ok(Step::Value(var_value, new_env))
+    }
+
+    fn eval_defmacro(&self, args: List<Value>, env: Env) -> Result<Step, Error> {
+        if args.len() < 2 {
+            return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                error_str: "defmacro requires at least 2 arguments".to_string(),
+            }));
+        }
+
+        // (defmacro name doc-string? attr-map? [params*] body)
+        let mut iter = args.iter().peekable();
+        let (macro_name, mut sym_meta) = match iter.next() {
+            Some(Value::Symbol { value, meta, .. }) => (*value, meta.clone()),
+            _ => {
+                return Err(Error::SyntaxError(SyntaxError::InvalidSymbol {
+                    value: "First argument to defmacro must be a symbol".to_string(),
+                }));
+            }
+        };
+
+        let docstring = match iter.peek() {
+            Some(Value::String { value, .. }) => {
+                iter.next();
+                Some(value.to_string())
+            }
+            _ => None,
+        };
+
+        // Add docstring to macro meta
+        if let Some(doc) = docstring {
+            let doc_key = Value::Keyword {
+                span: synthetic_span(),
+                value: interner::intern_kw("doc"),
+            };
+            let doc_value =
+                Value::String { span: synthetic_span(), value: Arc::from(doc) };
+
+            match sym_meta.as_mut() {
+                Some(meta) => {
+                    meta.insert(doc_key.clone(), doc_value.clone());
+                }
+                None => {
+                    sym_meta = Some(Metadata::from([(doc_key, doc_value)]));
+                }
+            }
+        }
+
+        // Handle attr-map if present, adding it to macro meta
+        if let Some(Value::Map { value: attr_map, .. }) = iter.peek() {
+            iter.next();
+            match sym_meta.as_mut() {
+                Some(meta) => {
+                    for (k, v) in attr_map.iter() {
+                        meta.insert(k.clone(), v.clone());
+                    }
+                }
+                None => {
+                    let mut new_meta = Metadata::new();
+                    for (k, v) in attr_map.iter() {
+                        new_meta.insert(k.clone(), v.clone());
+                    }
+                    sym_meta = Some(new_meta);
+                }
+            }
+        };
+
+        let params = match iter.next() {
+            Some(Value::Vector { value, .. }) => value.clone(),
+            _ => {
+                return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                    error_str: "defmacro requires a vector of parameters"
+                        .to_string(),
+                }));
+            }
+        };
+
+        let body = iter.cloned().collect::<List<Value>>();
+        let body_arc = if body.is_empty() {
+            Arc::new(List::new().prepend(Value::Nil { span: synthetic_span() }))
+        } else {
+            Arc::new(body)
+        };
+
+        let func = Value::Function {
+            span: synthetic_span(),
+            name: Some(macro_name),
+            params,
+            body: body_arc,
+            env: Arc::new(env.clone()),
+        };
+
+        // A macro is just a Var with is_macro=true
+        let macro_var =
+            Var::new(macro_name, env.ns.clone(), Some(func), sym_meta, true, false);
+        let var_arc = Arc::new(macro_var);
+
+        let new_env = env.insert_ns(macro_name, var_arc.clone());
+        Ok(Step::Value(
+            Value::Var { span: synthetic_span(), value: var_arc },
+            new_env,
+        ))
     }
 
     fn eval_if(&self, args: List<Value>, mut env: Env) -> Result<Step, Error> {
@@ -509,6 +675,7 @@ impl Evaluator {
             }));
         }
 
+        // (fn name? [params* ] expr*)
         let mut iter = args.iter().peekable();
         let fn_name = match iter.peek() {
             Some(Value::Symbol { value, .. }) => {
@@ -613,7 +780,7 @@ impl Evaluator {
             return Ok(Step::Value(Value::Nil { span: synthetic_span() }, env));
         }
 
-        let body_form = self.make_do_value(body_list);
+        let body_form = make_do_value(self, body_list);
         Ok(Step::Tail { form: body_form, env: loop_env, restore: Some(env) })
     }
 
@@ -645,36 +812,40 @@ impl Evaluator {
         Ok(Step::Recur(context, Arc::new(Vector::from_iter(evaluated_args)), env))
     }
 
-    fn is_special_form(&self, sym: SymId) -> bool {
-        sym == self.core_syms.s_def
-            || sym == self.core_syms.s_if
-            || sym == self.core_syms.s_let
-            || sym == self.core_syms.s_do
-            || sym == self.core_syms.s_quote
-            || sym == self.core_syms.s_loop
-            || sym == self.core_syms.s_recur
-            || sym == self.core_syms.s_fn
-    }
-
-    fn make_do_value(&self, body: Arc<List<Value>>) -> Value {
-        if body.is_empty() {
-            Value::Nil { span: synthetic_span() }
-        } else {
-            let forms: Vec<Value> = body.iter().cloned().collect();
-            let mut list = List::new();
-            for form in forms.into_iter().rev() {
-                list = list.prepend(form);
-            }
-            list = list.prepend(Value::SpecialForm {
-                span: synthetic_span(),
-                name: self.core_syms.s_do,
-            });
-            Value::List { span: synthetic_span(), value: Arc::new(list), meta: None }
-        }
+    pub fn is_special_form(&self, sym: SymId) -> bool {
+        sym == self.special_forms.s_def
+            || sym == self.special_forms.s_if
+            || sym == self.special_forms.s_let
+            || sym == self.special_forms.s_do
+            || sym == self.special_forms.s_quote
+            || sym == self.special_forms.s_loop
+            || sym == self.special_forms.s_recur
+            || sym == self.special_forms.s_fn
     }
 }
 
-fn synthetic_span() -> Span {
+//===----------------------------------------------------------------------===//
+// Helper functions
+//===----------------------------------------------------------------------===//
+
+pub fn make_do_value(evaluator: &Evaluator, body: Arc<List<Value>>) -> Value {
+    if body.is_empty() {
+        Value::Nil { span: synthetic_span() }
+    } else {
+        let forms: Vec<Value> = body.iter().cloned().collect();
+        let mut list = List::new();
+        for form in forms.into_iter().rev() {
+            list = list.prepend(form);
+        }
+        list = list.prepend(Value::SpecialForm {
+            span: synthetic_span(),
+            name: evaluator.special_forms.s_do,
+        });
+        Value::List { span: synthetic_span(), value: Arc::new(list), meta: None }
+    }
+}
+
+pub fn synthetic_span() -> Span {
     Span { start: 0, end: 0 }
 }
 
@@ -682,6 +853,7 @@ fn synthetic_span() -> Span {
 mod tests {
     use super::*;
     use crate::collections::List;
+    use crate::core::native_fns::{macroexpand, macroexpand1};
     use crate::core::namespace;
 
     /// Setup a new evaluator and environment for testing.
@@ -692,7 +864,7 @@ mod tests {
         (eval, env)
     }
 
-    /// Helper function to create a special form 
+    /// Helper function to create a special form
     /// with a list that starts with a special form symbol.
     fn make_special_form_list(sym: SymId, args: Vec<Value>) -> Value {
         let mut list = List::new();
@@ -726,27 +898,27 @@ mod tests {
         result_sym: SymId,
     ) -> Value {
         let recur_stage_two = make_special_form_list(
-            eval.core_syms.s_recur,
+            eval.special_forms.s_recur,
             vec![bool_val(false), bool_val(true), bool_val(false), int_val(0)],
         );
 
         let recur_stage_three = make_special_form_list(
-            eval.core_syms.s_recur,
+            eval.special_forms.s_recur,
             vec![bool_val(false), bool_val(false), bool_val(true), int_val(1)],
         );
 
         let final_if = make_special_form_list(
-            eval.core_syms.s_if,
+            eval.special_forms.s_if,
             vec![symbol(flag_c), symbol(result_sym), int_val(-1)],
         );
 
         let inner_if = make_special_form_list(
-            eval.core_syms.s_if,
+            eval.special_forms.s_if,
             vec![symbol(flag_b), recur_stage_three, final_if],
         );
 
         make_special_form_list(
-            eval.core_syms.s_if,
+            eval.special_forms.s_if,
             vec![symbol(flag_a), recur_stage_two, inner_if],
         )
     }
@@ -840,7 +1012,7 @@ mod tests {
     fn test_trampoline_if_branches() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
-            eval.core_syms.s_if,
+            eval.special_forms.s_if,
             vec![
                 Value::Bool { span: synthetic_span(), value: true },
                 Value::Int { span: synthetic_span(), value: 1 },
@@ -859,7 +1031,7 @@ mod tests {
     fn test_trampoline_do_last_value() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
-            eval.core_syms.s_do,
+            eval.special_forms.s_do,
             vec![
                 Value::Int { span: synthetic_span(), value: 1 },
                 Value::Int { span: synthetic_span(), value: 2 },
@@ -879,7 +1051,7 @@ mod tests {
         let (eval, mut env) = setup();
         let quoted = Value::Int { span: synthetic_span(), value: 10 };
         let form =
-            make_special_form_list(eval.core_syms.s_quote, vec![quoted.clone()]);
+            make_special_form_list(eval.special_forms.s_quote, vec![quoted.clone()]);
 
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
@@ -897,7 +1069,7 @@ mod tests {
             Value::Int { span: synthetic_span(), value: 10 },
         ]);
         let form = make_special_form_list(
-            eval.core_syms.s_let,
+            eval.special_forms.s_let,
             vec![
                 Value::Vector {
                     span: synthetic_span(),
@@ -920,7 +1092,7 @@ mod tests {
         let (eval, mut env) = setup();
         let sym = interner::intern_sym("def-test");
         let form = make_special_form_list(
-            eval.core_syms.s_def,
+            eval.special_forms.s_def,
             vec![
                 Value::Symbol { span: synthetic_span(), value: sym, meta: None },
                 Value::Int { span: synthetic_span(), value: 99 },
@@ -971,7 +1143,7 @@ mod tests {
             build_three_stage_recur_body(&eval, flag_a, flag_b, flag_c, result_sym);
 
         let loop_form = make_special_form_list(
-            eval.core_syms.s_loop,
+            eval.special_forms.s_loop,
             vec![bindings_value, loop_body],
         );
 
@@ -1015,7 +1187,9 @@ mod tests {
         };
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
-            Value::Nil { .. } => {}
+            Value::List { value: list, .. } => {
+                assert!(list.is_empty());
+            }
             _ => panic!("Expected Nil for empty list, got {:?}", result),
         }
     }
@@ -1136,7 +1310,7 @@ mod tests {
         let (eval, mut env) = setup();
         let quoted = Value::Int { span: synthetic_span(), value: 42 };
         let form =
-            make_special_form_list(eval.core_syms.s_quote, vec![quoted.clone()]);
+            make_special_form_list(eval.special_forms.s_quote, vec![quoted.clone()]);
 
         let result = eval.eval(&form, &mut env).unwrap();
         match result {
@@ -1153,12 +1327,8 @@ mod tests {
     fn test_eval_if_truthy_branch() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
-            eval.core_syms.s_if,
-            vec![
-                bool_val(true),
-                int_val(42),
-                int_val(0),
-            ],
+            eval.special_forms.s_if,
+            vec![bool_val(true), int_val(42), int_val(0)],
         );
 
         let result = eval.eval(&form, &mut env).unwrap();
@@ -1172,12 +1342,8 @@ mod tests {
     fn test_eval_if_falsey_branch() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
-            eval.core_syms.s_if,
-            vec![
-                bool_val(false),
-                int_val(42),
-                int_val(7),
-            ],
+            eval.special_forms.s_if,
+            vec![bool_val(false), int_val(42), int_val(7)],
         );
 
         let result = eval.eval(&form, &mut env).unwrap();
@@ -1191,11 +1357,8 @@ mod tests {
     fn test_eval_if_without_else_returns_nil() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
-            eval.core_syms.s_if,
-            vec![
-                bool_val(false),
-                int_val(42),
-            ],
+            eval.special_forms.s_if,
+            vec![bool_val(false), int_val(42)],
         );
 
         let result = eval.eval(&form, &mut env).unwrap();
@@ -1209,12 +1372,8 @@ mod tests {
     fn test_eval_if_nil_condition_treated_as_false() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
-            eval.core_syms.s_if,
-            vec![
-                Value::Nil { span: synthetic_span() },
-                int_val(1),
-                int_val(2),
-            ],
+            eval.special_forms.s_if,
+            vec![Value::Nil { span: synthetic_span() }, int_val(1), int_val(2)],
         );
 
         let result = eval.eval(&form, &mut env).unwrap();
@@ -1232,7 +1391,7 @@ mod tests {
             span: synthetic_span(),
             value: Arc::new(List::new().prepend(Value::SpecialForm {
                 span: synthetic_span(),
-                name: eval.core_syms.s_if,
+                name: eval.special_forms.s_if,
             })),
             meta: None,
         };
@@ -1247,7 +1406,7 @@ mod tests {
     fn test_eval_do_returns_last() {
         let (eval, mut env) = setup();
         let form = make_special_form_list(
-            eval.core_syms.s_do,
+            eval.special_forms.s_do,
             vec![
                 Value::Int { span: synthetic_span(), value: 1 },
                 Value::Int { span: synthetic_span(), value: 2 },
@@ -1265,7 +1424,7 @@ mod tests {
     fn test_eval_do_empty_returns_nil() {
         let (eval, mut env) = setup();
 
-        let form = make_special_form_list(eval.core_syms.s_do, vec![]);
+        let form = make_special_form_list(eval.special_forms.s_do, vec![]);
         let result = eval.eval(&form, &mut env).unwrap();
 
         match result {
@@ -1281,7 +1440,7 @@ mod tests {
         let flag_b = interner::intern_sym("do-flag-b");
 
         let set_flag_b = make_special_form_list(
-            eval.core_syms.s_let,
+            eval.special_forms.s_let,
             vec![
                 Value::Vector {
                     span: synthetic_span(),
@@ -1297,7 +1456,7 @@ mod tests {
 
         let forms = vec![
             make_special_form_list(
-                eval.core_syms.s_let,
+                eval.special_forms.s_let,
                 vec![
                     Value::Vector {
                         span: synthetic_span(),
@@ -1314,7 +1473,7 @@ mod tests {
             Value::Int { span: synthetic_span(), value: 5 },
         ];
 
-        let form = make_special_form_list(eval.core_syms.s_do, forms);
+        let form = make_special_form_list(eval.special_forms.s_do, forms);
         let result = eval.eval(&form, &mut env).unwrap();
 
         match result {
@@ -1334,11 +1493,13 @@ mod tests {
             value: Arc::new(Vector::from_iter(vec![symbol(sym), int_val(2)])),
             meta: None,
         };
-        let inner_form =
-            make_special_form_list(eval.core_syms.s_let, vec![inner_binding, symbol(sym)]);
+        let inner_form = make_special_form_list(
+            eval.special_forms.s_let,
+            vec![inner_binding, symbol(sym)],
+        );
 
         let form = make_special_form_list(
-            eval.core_syms.s_do,
+            eval.special_forms.s_do,
             vec![inner_form, symbol(sym)],
         );
 
@@ -1368,7 +1529,7 @@ mod tests {
         let body = symbol(x_sym);
 
         let form = make_special_form_list(
-            eval.core_syms.s_let,
+            eval.special_forms.s_let,
             vec![bindings_value, body],
         );
 
@@ -1378,7 +1539,10 @@ mod tests {
             other => panic!("Expected Int(10), got {:?}", other),
         }
 
-        assert!(env.get(x_sym).is_none(), "let should not leak bindings into parent env");
+        assert!(
+            env.get(x_sym).is_none(),
+            "let should not leak bindings into parent env"
+        );
     }
 
     //===----------------------------------------------------------------------===//
@@ -1399,16 +1563,18 @@ mod tests {
             meta: None,
         };
 
-        let body_list = Arc::new(
-            List::new().prepend(symbol(param_sym))
-        );
+        let body_list = Arc::new(List::new().prepend(symbol(param_sym)));
 
         let form = make_special_form_list(
-            eval.core_syms.s_fn,
+            eval.special_forms.s_fn,
             vec![
                 symbol(fn_name),
                 params_value,
-                Value::List { span: synthetic_span(), value: body_list.clone(), meta: None },
+                Value::List {
+                    span: synthetic_span(),
+                    value: body_list.clone(),
+                    meta: None,
+                },
             ],
         );
 
@@ -1444,8 +1610,10 @@ mod tests {
         };
 
         let body_form = symbol(param_sym);
-        let fn_form =
-            make_special_form_list(eval.core_syms.s_fn, vec![params_value, body_form]);
+        let fn_form = make_special_form_list(
+            eval.special_forms.s_fn,
+            vec![params_value, body_form],
+        );
 
         let mut invocation_list = List::new();
         invocation_list = invocation_list.prepend(int_val(25));
@@ -1476,8 +1644,10 @@ mod tests {
         };
 
         let body_form = symbol(param_sym);
-        let fn_form =
-            make_special_form_list(eval.core_syms.s_fn, vec![params_value, body_form]);
+        let fn_form = make_special_form_list(
+            eval.special_forms.s_fn,
+            vec![params_value, body_form],
+        );
 
         let mut invocation_list = List::new();
         invocation_list = invocation_list.prepend(fn_form);
@@ -1490,13 +1660,14 @@ mod tests {
         let result = eval.eval(&invocation, &mut env);
         assert!(result.is_err());
         match result {
-            Err(Error::SyntaxError(SyntaxError::WrongArgumentCount { error_str })) => {
+            Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                error_str,
+            })) => {
                 assert!(error_str.contains("Wrong number of arguments"));
             }
             other => panic!("Expected WrongArgumentCount error, got {:?}", other),
         }
     }
-
 
     //===----------------------------------------------------------------------===//
     // Environment Tests: create_child_with_bindings
@@ -1571,7 +1742,7 @@ mod tests {
             Value::Symbol { span: synthetic_span(), value: x_sym, meta: None };
 
         let form = make_special_form_list(
-            eval.core_syms.s_let,
+            eval.special_forms.s_let,
             vec![
                 Value::Vector {
                     span: synthetic_span(),
@@ -1619,7 +1790,7 @@ mod tests {
             build_three_stage_recur_body(&eval, flag_a, flag_b, flag_c, result_sym);
 
         let loop_form = make_special_form_list(
-            eval.core_syms.s_loop,
+            eval.special_forms.s_loop,
             vec![bindings_value, loop_body],
         );
 
@@ -1657,7 +1828,7 @@ mod tests {
             build_three_stage_recur_body(&eval, flag_a, flag_b, flag_c, result_sym);
 
         let fn_form = make_special_form_list(
-            eval.core_syms.s_fn,
+            eval.special_forms.s_fn,
             vec![params_value, body_form],
         );
 
@@ -1696,7 +1867,7 @@ mod tests {
 
         let body_value = symbol(param_sym);
         let fn_form = make_special_form_list(
-            eval.core_syms.s_fn,
+            eval.special_forms.s_fn,
             vec![params_value, body_value],
         );
 
@@ -1743,7 +1914,7 @@ mod tests {
             build_three_stage_recur_body(&eval, flag_a, flag_b, flag_c, result_sym);
 
         let fn_form = make_special_form_list(
-            eval.core_syms.s_fn,
+            eval.special_forms.s_fn,
             vec![params_value, body_form],
         );
 
@@ -1765,5 +1936,165 @@ mod tests {
             Value::Int { value, .. } => assert_eq!(value, 1),
             other => panic!("Expected Int(1), got {:?}", other),
         }
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Native Functions Tests
+    //===----------------------------------------------------------------------===//
+
+    #[test]
+    fn test_native_function_macroexpand1() {
+        let (_eval, mut env) = setup();
+
+        // Define a simple macro (defmacro my-macro [x] x)
+        let macro_sym = interner::intern_sym("my-macro");
+        let param_sym = interner::intern_sym("x");
+        let param_value =
+            Value::Symbol { span: synthetic_span(), value: param_sym, meta: None };
+        let params =
+            Arc::new(Vector::from_iter(vec![param_value.clone()]));
+        let body =
+            Arc::new(List::from_iter(vec![param_value.clone()]));
+
+        let macro_fn = Value::Function {
+            span: synthetic_span(),
+            name: Some(macro_sym),
+            params: params.clone(),
+            body,
+            env: Arc::new(env.clone()),
+        };
+
+        let macro_var = Var::new(
+            macro_sym,
+            env.ns.clone(),
+            Some(macro_fn),
+            None,
+            true,
+            false,
+        );
+        env = env.insert_ns(macro_sym, Arc::new(macro_var));
+
+        // Construct a macro call form: (my-macro (+ 1 2))
+        let plus_sym = interner::intern_sym("+");
+        let arg_form = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(List::from_iter(vec![
+                Value::Symbol {
+                    span: synthetic_span(),
+                    value: plus_sym,
+                    meta: None,
+                },
+                Value::Int { span: synthetic_span(), value: 1 },
+                Value::Int { span: synthetic_span(), value: 2 },
+            ])),
+            meta: None,
+        };
+        let macro_call = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(List::from_iter(vec![
+                Value::Symbol {
+                    span: synthetic_span(),
+                    value: macro_sym,
+                    meta: None,
+                },
+                arg_form.clone(),
+            ])),
+            meta: None,
+        };
+
+        let expanded = macroexpand1(&[macro_call], &mut env).unwrap();
+        assert_eq!(expanded, arg_form);
+
+        // Non-macro forms are returned unchanged
+        let non_macro = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(List::from_iter(vec![
+                Value::Symbol {
+                    span: synthetic_span(),
+                    value: plus_sym,
+                    meta: None,
+                },
+                Value::Int { span: synthetic_span(), value: 1 },
+                Value::Int { span: synthetic_span(), value: 2 },
+            ])),
+            meta: None,
+        };
+        let unchanged = macroexpand1(&[non_macro.clone()], &mut env).unwrap();
+        assert_eq!(unchanged, non_macro);
+    }
+
+    #[test]
+    fn test_native_function_macroexpand() {
+        let (eval, mut env) = setup();
+
+        let inner_sym = interner::intern_sym("inner-macro");
+        let inner_body_form = make_special_form_list(
+            eval.special_forms.s_quote,
+            vec![Value::Int { span: synthetic_span(), value: 42 }],
+        );
+        let inner_macro_fn = Value::Function {
+            span: synthetic_span(),
+            name: Some(inner_sym),
+            params: Arc::new(Vector::new()),
+            body: Arc::new(List::from_iter(vec![inner_body_form])),
+            env: Arc::new(env.clone()),
+        };
+        let inner_macro_var = Var::new(
+            inner_sym,
+            env.ns.clone(),
+            Some(inner_macro_fn),
+            None,
+            true,
+            false,
+        );
+        env = env.insert_ns(inner_sym, Arc::new(inner_macro_var));
+
+        let outer_sym = interner::intern_sym("outer-macro");
+        let inner_call = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(List::from_iter(vec![Value::Symbol {
+                span: synthetic_span(),
+                value: inner_sym,
+                meta: None,
+            }])),
+            meta: None,
+        };
+        let outer_body_form = make_special_form_list(
+            eval.special_forms.s_quote,
+            vec![inner_call.clone()],
+        );
+        let outer_macro_fn = Value::Function {
+            span: synthetic_span(),
+            name: Some(outer_sym),
+            params: Arc::new(Vector::new()),
+            body: Arc::new(List::from_iter(vec![outer_body_form])),
+            env: Arc::new(env.clone()),
+        };
+        let outer_macro_var = Var::new(
+            outer_sym,
+            env.ns.clone(),
+            Some(outer_macro_fn),
+            None,
+            true,
+            false,
+        );
+        env = env.insert_ns(outer_sym, Arc::new(outer_macro_var));
+
+        let macro_call = Value::List {
+            span: synthetic_span(),
+            value: Arc::new(List::from_iter(vec![Value::Symbol {
+                span: synthetic_span(),
+                value: outer_sym,
+                meta: None,
+            }])),
+            meta: None,
+        };
+
+        let expanded = macroexpand(&[macro_call], &mut env).unwrap();
+        assert_eq!(expanded, Value::Int { span: synthetic_span(), value: 42 });
+
+        let non_macro = Value::Int { span: synthetic_span(), value: 7 };
+        let unchanged = macroexpand(&[non_macro.clone()], &mut env).unwrap();
+        assert_eq!(unchanged, non_macro);
     }
 }

@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
-use std::collections::HashMap;
 
+use crate::collections::{List, Vector};
 use crate::env::Env;
-use crate::error::Error;
-use crate::reader::Span;
-use crate::value::Value;
+use crate::error::{Error, SyntaxError};
+use crate::eval::{Evaluator, make_do_value, synthetic_span};
 use crate::interner::{self, SymId};
+use crate::value::Value;
 
 //===----------------------------------------------------------------------===//
 // Native Functions
@@ -14,6 +15,7 @@ use crate::interner::{self, SymId};
 
 pub type NativeFn = fn(&[Value], &mut Env) -> Result<Value, Error>;
 
+#[derive(Debug, Clone)]
 pub struct NativeRegistry {
     fns: HashMap<SymId, NativeFn>,
 }
@@ -27,6 +29,8 @@ impl NativeRegistry {
         fns.insert(interner::intern_sym("dissoc"), dissoc as NativeFn);
         fns.insert(interner::intern_sym("get"), get as NativeFn);
         fns.insert(interner::intern_sym("count"), count as NativeFn);
+        fns.insert(interner::intern_sym("macroexpand1"), macroexpand1 as NativeFn);
+        fns.insert(interner::intern_sym("macroexpand"), macroexpand as NativeFn);
         Self { fns }
     }
 
@@ -325,12 +329,130 @@ pub fn count(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
     Ok(Value::Int { span: synthetic_span(), value: int_value })
 }
 
+/// `(macroexpand1 form)` — expands the first macro in the form.
+pub fn macroexpand1(args: &[Value], env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 1 {
+        return Err(Error::RuntimeError(
+            "macroexpand1 requires a single argument: a form to macroexpand"
+                .to_string(),
+        ));
+    }
+
+    // Code similar to expand_macro in eval.rs
+    match &args[0] {
+        Value::List { value: list, .. } => {
+            if list.is_empty() {
+                return Ok(args[0].clone());
+            }
+
+            let head = list.head().unwrap().clone();
+            let macro_args = list.tail().unwrap_or_else(List::new);
+
+            let maybe_macro_var = match &head {
+                Value::Var { value: var, .. } => Some(var.clone()),
+                Value::Symbol { value: sym, .. } => env.ns.get(*sym).cloned(),
+                _ => return Ok(head.clone()),
+            };
+
+            if let Some(var) = maybe_macro_var {
+                if var.is_macro() {
+                    let macro_name = interner::sym_to_str(var.symbol);
+                    let storage = var.value.as_ref().ok_or_else(|| {
+                        Error::RuntimeError(format!(
+                            "Macro '{}' is unbound",
+                            macro_name
+                        ))
+                    })?;
+
+                    let macro_value = storage.read().map_err(|_| {
+                        Error::RuntimeError(format!(
+                            "Failed to read macro binding for '{}'",
+                            macro_name
+                        ))
+                    })?;
+
+                    let macro_fn = macro_value.clone();
+                    drop(macro_value);
+
+                    let (params, body, macro_env) = match macro_fn {
+                        Value::Function { params, body, env: fn_env, .. } => {
+                            (params, body, fn_env)
+                        }
+                        other => {
+                            return Err(Error::TypeError {
+                                expected: "function".to_string(),
+                                actual: other.as_str().to_string(),
+                            });
+                        }
+                    };
+
+                    let provided_args: Vec<Value> = macro_args.iter().cloned().collect();
+                    if params.len() != provided_args.len() {
+                        return Err(Error::SyntaxError(
+                            SyntaxError::WrongArgumentCount {
+                                error_str: format!(
+                                    "Wrong number of arguments to macro. Expected {}, got {}",
+                                    params.len(),
+                                    provided_args.len()
+                                ),
+                            },
+                        ));
+                    }
+
+                    let mut binding_pairs =
+                        Vec::with_capacity(provided_args.len() * 2);
+                    for (param, arg_form) in params.iter().zip(provided_args.iter())
+                    {
+                        binding_pairs.push(param.clone());
+                        binding_pairs.push(arg_form.clone());
+                    }
+                    let bindings = Arc::new(Vector::from_iter(binding_pairs));
+                    let mut macro_scope_env =
+                        macro_env.create_child_with_bindings(bindings);
+
+                    // Create a new evaluator to evaluate the macro body.
+                    let evaluator = Evaluator::new();
+                    // Create a do value for the macro body.
+                    let body_form = make_do_value(&evaluator, body.clone());
+                    // Evaluate the macro body.
+                    let expansion_form =
+                        evaluator.eval(&body_form, &mut macro_scope_env)?;
+
+                    // Return the expanded form.
+                    Ok(expansion_form)
+                } else {
+                    return Ok(args[0].clone());
+                }
+            } else {
+                return Ok(args[0].clone());
+            }
+        }
+        _ => return Ok(args[0].clone()),
+    }
+}
+
+/// `(macroexpand form)` — expands all macros in the form.
+pub fn macroexpand(args: &[Value], env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 1 {
+        return Err(Error::RuntimeError(
+            "macroexpand requires a single argument: a form to macroexpand"
+                .to_string(),
+        ));
+    }
+    
+    let mut expanded = macroexpand1(args, env)?;
+    while let Value::List { value: list, .. } = &expanded {
+        if list.is_empty() {
+            break;
+        }
+        expanded = macroexpand1(&[expanded], env)?;
+    }
+    Ok(expanded)
+}
+
 //===----------------------------------------------------------------------===//
 // Utils
 //===----------------------------------------------------------------------===//
-fn synthetic_span() -> Span {
-    Span { start: 0, end: 0 }
-}
 
 fn type_error(expected: &str, actual: &Value) -> Error {
     Error::TypeError {

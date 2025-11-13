@@ -7,4 +7,5 @@ pub mod interner;
 pub mod core;
 pub mod reader;
 pub mod repl;
+pub mod runtime;
 pub mod value;

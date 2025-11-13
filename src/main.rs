@@ -5,7 +5,8 @@ extern crate rustyline;
 
 use evolve::devtools;
 use evolve::error::{Diagnostic, Error};
-use evolve::reader::{Reader, Source};
+use evolve::reader::Source;
+use evolve::runtime::Runtime;
 use evolve::repl::REPL;
 use std::{env, fs, path::Path};
 
@@ -78,7 +79,8 @@ fn run_file(file_path: &str, print_ast: bool) -> Result<(), Diagnostic> {
         notes: None,
     })?;
 
-    let ast = Reader::read(&source_code, Source::File(path.to_path_buf()))?;
+    let rt = Runtime::new();
+    let ast = rt.rep(&source_code, Source::File(path.to_path_buf()))?;
 
     if print_ast {
         println!("{}", devtools::pretty_print_ast(&ast));

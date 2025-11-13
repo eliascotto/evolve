@@ -1,10 +1,9 @@
-use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::interner::{KeywId, SymId};
-use crate::core::Namespace;
+use crate::core::{Metadata, Namespace};
+use crate::interner::SymId;
 use crate::value::Value;
 
 #[derive(Debug)]
@@ -16,7 +15,9 @@ pub struct Var {
     // Value binding
     pub value: Option<Arc<RwLock<Value>>>,
 
-    pub meta: Option<BTreeMap<KeywId, Value>>,
+    pub meta: Option<Metadata>,
+    // Macro flag
+    is_macro: AtomicBool,
     // Dynamic flag
     dynamic: AtomicBool,
     // Revision counter
@@ -24,13 +25,21 @@ pub struct Var {
 }
 
 impl Var {
-    pub fn new(symbol: SymId, ns: Arc<Namespace>) -> Self {
+    pub fn new(
+        symbol: SymId,
+        ns: Arc<Namespace>,
+        value: Option<Value>,
+        meta: Option<Metadata>,
+        is_macro: bool,
+        dynamic: bool,
+    ) -> Self {
         Self {
             symbol,
             ns,
-            value: None,
-            meta: None,
-            dynamic: AtomicBool::new(false),
+            value: value.map(|v| Arc::new(RwLock::new(v))),
+            meta,
+            is_macro: AtomicBool::new(is_macro),
+            dynamic: AtomicBool::new(dynamic),
             rev: AtomicU64::new(0),
         }
     }
@@ -39,13 +48,14 @@ impl Var {
         symbol: SymId,
         ns: Arc<Namespace>,
         value: Value,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     ) -> Self {
         Self {
             symbol,
             ns,
             value: Some(Arc::new(RwLock::new(value))),
-            meta: meta,
+            meta,
+            is_macro: AtomicBool::new(false),
             dynamic: AtomicBool::new(false),
             rev: AtomicU64::new(0),
         }
@@ -55,8 +65,12 @@ impl Var {
         self.value.is_some()
     }
 
-    pub fn set_meta(&self, meta: Option<BTreeMap<KeywId, Value>>) -> Self {
-        Self { meta: meta, ..self.clone() }
+    pub fn set_meta(&self, meta: Option<Metadata>) -> Self {
+        Self { meta, ..self.clone() }
+    }
+
+    pub fn is_macro(&self) -> bool {
+        self.is_macro.load(Ordering::Relaxed)
     }
 }
 
@@ -67,6 +81,7 @@ impl Clone for Var {
             ns: self.ns.clone(),
             value: self.value.clone(),
             meta: self.meta.clone(),
+            is_macro: AtomicBool::new(self.is_macro.load(Ordering::Relaxed)),
             dynamic: AtomicBool::new(self.dynamic.load(Ordering::Relaxed)),
             rev: AtomicU64::new(self.rev.load(Ordering::Relaxed)),
         }

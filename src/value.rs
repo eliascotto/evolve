@@ -10,7 +10,7 @@ use crate::env::Env;
 use crate::error::{Error, SyntaxError};
 use crate::interner::{self, KeywId, NsId, SymId};
 use crate::reader::Span;
-use crate::core::Var;
+use crate::core::{Metadata, Var};
 use crate::core::native_fns::NativeFn;
 
 //===----------------------------------------------------------------------===//
@@ -46,7 +46,7 @@ pub enum Value {
     Symbol {
         span: Span,
         value: SymId,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     },
     Keyword {
         span: Span,
@@ -56,22 +56,22 @@ pub enum Value {
     List {
         span: Span,
         value: Arc<List<Value>>,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     },
     Vector {
         span: Span,
         value: Arc<Vector<Value>>,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     },
     Map {
         span: Span,
         value: Arc<Map<Value, Value>>,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     },
     Set {
         span: Span,
         value: Arc<Set<Value>>,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     },
     // Namespace
     Namespace {
@@ -502,7 +502,7 @@ impl Value {
         }
     }
 
-    pub fn get_meta(&self) -> Option<BTreeMap<KeywId, Value>> {
+    pub fn get_meta(&self) -> Option<Metadata> {
         match self {
             Value::Symbol { meta, .. }
             | Value::List { meta, .. }
@@ -520,7 +520,7 @@ impl Value {
             | Value::List { meta, .. }
             | Value::Vector { meta, .. }
             | Value::Map { meta, .. }
-            | Value::Set { meta, .. } => meta.clone().unwrap_or_else(BTreeMap::new),
+            | Value::Set { meta, .. } => meta.clone().unwrap_or_else(Metadata::new),
             _ => {
                 return Err(Error::SyntaxError(SyntaxError::InvalidMeta {
                     reason: format!(
@@ -533,26 +533,16 @@ impl Value {
 
         // Handle meta_def: either a Keyword or a Map
         match meta_def {
-            Value::Keyword { span: _, value: kw } => {
+            Value::Keyword { span, value: kw } => {
                 // If meta_def is a Keyword, set its value to true
-                meta_map.insert(
-                    kw,
-                    Value::Bool { span: Span { start: 0, end: 0 }, value: true },
-                );
+                let key = Value::Keyword { span: span.clone(), value: kw };
+                let value = Value::Bool { span: Span { start: 0, end: 0 }, value: true };
+                meta_map.insert(key, value);
             }
             Value::Map { span: _, value: hm, meta: _ } => {
-                // If meta_def is a Map, only Keyword values are allowed as keys
+                // If meta_def is a Map, merge all entries directly
                 for (k, v) in hm.iter() {
-                    if let Value::Keyword { value: kw, span: _ } = k {
-                        meta_map.insert(*kw, v.clone());
-                    } else {
-                        return Err(Error::SyntaxError(SyntaxError::InvalidMeta {
-                            reason: format!(
-                                "Metadata map key must be a keyword, got {}",
-                                k.to_string()
-                            ),
-                        }));
-                    }
+                    meta_map.insert(k.clone(), v.clone());
                 }
             }
             _ => {
@@ -628,6 +618,22 @@ pub fn create_btree_set_from_sequence(seq: Vec<Value>) -> BTreeSet<Value> {
     seq.into_iter().collect()
 }
 
+/// Creates a list value.
+///
+/// # Arguments
+///
+/// * `span` - The span of the list.
+/// * `values` - The values to include in the list.
+///
+/// # Returns
+pub fn list(span: Span, values: Vec<Value>) -> Value {
+    Value::List { span: span, value: Arc::new(List::from_iter(values)), meta: None }
+}
+
+pub fn symbol(span: Span, value: SymId, meta: Option<Metadata>) -> Value {
+    Value::Symbol { span: span, value: value, meta: meta }
+}
+
 //===----------------------------------------------------------------------===//
 // Tests
 //===----------------------------------------------------------------------===//
@@ -635,8 +641,8 @@ pub fn create_btree_set_from_sequence(seq: Vec<Value>) -> BTreeSet<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{namespace, Metadata};
     use crate::interner;
-    use crate::core::namespace;
     use std::collections::BTreeMap;
 
     fn test_span() -> Span {
@@ -658,7 +664,7 @@ mod tests {
     }
 
     // Helper function to create a symbol with metadata
-    fn sym_with_meta(s: &str, meta: Option<BTreeMap<KeywId, Value>>) -> Value {
+    fn sym_with_meta(s: &str, meta: Option<Metadata>) -> Value {
         Value::Symbol { span: test_span(), value: interner::intern_sym(s), meta }
     }
 
@@ -670,7 +676,7 @@ mod tests {
     // Helper function to create a list with metadata
     fn list_with_meta(
         v: Vec<Value>,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     ) -> Value {
         Value::List { span: test_span(), value: Arc::new(List::from_iter(v)), meta }
     }
@@ -683,7 +689,7 @@ mod tests {
     // Helper function to create a map with metadata
     fn map_with_meta(
         m: BTreeMap<Value, Value>,
-        meta: Option<BTreeMap<KeywId, Value>>,
+        meta: Option<Metadata>,
     ) -> Value {
         let mut map = Map::new();
         for (k, v) in m {
@@ -699,11 +705,9 @@ mod tests {
     #[test]
     fn test_get_meta_supported_types() {
         // Types that support metadata should return Some or None
-        let mut meta_map = BTreeMap::new();
-        meta_map.insert(
-            interner::intern_kw("test"),
-            Value::Bool { span: test_span(), value: true },
-        );
+        let mut meta_map = Metadata::new();
+        meta_map
+            .insert(kw("test"), Value::Bool { span: test_span(), value: true });
 
         let sym_with = sym_with_meta("test", Some(meta_map.clone()));
         let sym_without = sym("test");
@@ -780,8 +784,9 @@ mod tests {
         let meta = result.get_meta().unwrap();
 
         assert_eq!(meta.len(), 1);
-        assert!(meta.contains_key(&interner::intern_kw("deprecated")));
-        match meta.get(&interner::intern_kw("deprecated")) {
+        let key = kw("deprecated");
+        assert!(meta.contains_key(&key));
+        match meta.get(&key) {
             Some(Value::Bool { value: true, .. }) => {}
             _ => panic!("Expected boolean true value"),
         }
@@ -838,17 +843,22 @@ mod tests {
         let meta_value =
             Value::Map { span: test_span(), value: Arc::new(map), meta: None };
 
-        assert!(sym.set_meta(meta_value).is_err());
+        let result = sym.set_meta(meta_value).unwrap();
+        let meta = result.get_meta().unwrap();
+        let int_key = Value::Int { span: test_span(), value: 1 };
+        assert!(meta.contains_key(&int_key));
+        match meta.get(&int_key) {
+            Some(Value::Int { value, .. }) => assert_eq!(*value, 42),
+            _ => panic!("Expected integer metadata value"),
+        }
     }
 
     #[test]
     fn test_set_meta_merges_existing() {
         // Setting metadata should merge with existing metadata
-        let mut existing_meta = BTreeMap::new();
-        existing_meta.insert(
-            interner::intern_kw("key1"),
-            Value::Int { span: test_span(), value: 1 },
-        );
+        let mut existing_meta = Metadata::new();
+        existing_meta
+            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let sym = sym_with_meta("test", Some(existing_meta));
 
         let mut new_meta_map = BTreeMap::new();
@@ -864,18 +874,18 @@ mod tests {
         let meta = result.get_meta().unwrap();
 
         assert_eq!(meta.len(), 2);
-        assert!(meta.contains_key(&interner::intern_kw("key1")));
-        assert!(meta.contains_key(&interner::intern_kw("key2")));
+        let key1 = kw("key1");
+        let key2 = kw("key2");
+        assert!(meta.contains_key(&key1));
+        assert!(meta.contains_key(&key2));
     }
 
     #[test]
     fn test_set_meta_overwrites_existing_key() {
         // Setting metadata should overwrite existing keys
-        let mut existing_meta = BTreeMap::new();
-        existing_meta.insert(
-            interner::intern_kw("key1"),
-            Value::Int { span: test_span(), value: 1 },
-        );
+        let mut existing_meta = Metadata::new();
+        existing_meta
+            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let sym = sym_with_meta("test", Some(existing_meta));
 
         let mut new_meta_map = BTreeMap::new();
@@ -894,7 +904,8 @@ mod tests {
         let meta = result.get_meta().unwrap();
 
         assert_eq!(meta.len(), 1);
-        match meta.get(&interner::intern_kw("key1")) {
+        let key = kw("key1");
+        match meta.get(&key) {
             Some(Value::String { value: v, .. }) => assert_eq!(v.as_ref(), "new"),
             _ => panic!("Expected string value"),
         }
@@ -903,11 +914,9 @@ mod tests {
     #[test]
     fn test_metadata_preserved_on_clone() {
         // Metadata should be preserved when cloning
-        let mut meta_map = BTreeMap::new();
-        meta_map.insert(
-            interner::intern_kw("test"),
-            Value::Bool { span: test_span(), value: true },
-        );
+        let mut meta_map = Metadata::new();
+        meta_map
+            .insert(kw("test"), Value::Bool { span: test_span(), value: true });
         let sym = sym_with_meta("test", Some(meta_map));
 
         let cloned = sym.clone();
@@ -946,18 +955,14 @@ mod tests {
     fn test_equality_ignores_metadata() {
         // Two values with same content but different metadata should be equal
         let sym1 = sym("test");
-        let mut meta1 = BTreeMap::new();
-        meta1.insert(
-            interner::intern_kw("key1"),
-            Value::Int { span: test_span(), value: 1 },
-        );
+        let mut meta1 = Metadata::new();
+        meta1
+            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let sym1_with_meta = sym_with_meta("test", Some(meta1));
 
-        let mut meta2 = BTreeMap::new();
-        meta2.insert(
-            interner::intern_kw("key2"),
-            Value::Int { span: test_span(), value: 2 },
-        );
+        let mut meta2 = Metadata::new();
+        meta2
+            .insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
         let sym2_with_meta = sym_with_meta("test", Some(meta2));
 
         assert_eq!(sym1, sym1_with_meta);
@@ -1205,21 +1210,17 @@ mod tests {
     #[test]
     fn test_equality_collections_ignore_metadata() {
         // Collections with same content but different metadata should be equal
-        let mut meta1 = BTreeMap::new();
-        meta1.insert(
-            interner::intern_kw("key1"),
-            Value::Int { span: test_span(), value: 1 },
-        );
+        let mut meta1 = Metadata::new();
+        meta1
+            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let list1 = list_with_meta(
             vec![Value::Int { span: test_span(), value: 42 }],
             Some(meta1),
         );
 
-        let mut meta2 = BTreeMap::new();
-        meta2.insert(
-            interner::intern_kw("key2"),
-            Value::Int { span: test_span(), value: 2 },
-        );
+        let mut meta2 = Metadata::new();
+        meta2
+            .insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
         let list2 = list_with_meta(
             vec![Value::Int { span: test_span(), value: 42 }],
             Some(meta2),

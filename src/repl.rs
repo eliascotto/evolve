@@ -1,26 +1,28 @@
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::reader::{Reader, Source};
+use crate::reader::Source;
 use crate::{devtools, error::Diagnostic};
+use crate::runtime::{Runtime, RuntimeRef};
 
 pub struct REPL {
     pub print_ast: bool,
+    pub runtime: RuntimeRef,
 }
 
 impl REPL {
     pub fn new(print_ast: bool) -> Self {
-        REPL { print_ast }
+        REPL { print_ast, runtime: Runtime::new() }
     }
 
     pub fn rep(&self, input: &str) -> Result<String, Diagnostic> {
-        let ast = Reader::read(input, Source::REPL)?;
+        let value = Runtime::rep(self.runtime.clone(), input, Source::REPL)?;
 
         if self.print_ast {
-            println!("{}", devtools::pretty_print_ast(&ast));
+            println!("{}", devtools::pretty_print_ast(&value));
         }
 
-        Ok(ast.to_string())
+        Ok(value.to_string())
     }
 
     pub fn run(&self) {
