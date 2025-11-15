@@ -282,7 +282,7 @@ mod tests {
     use super::List;
     use crate::interner;
     use crate::reader::Span;
-    use crate::value::Value;
+    use crate::value::{self, Value};
     use std::sync::Arc;
 
     #[test]
@@ -345,11 +345,12 @@ mod tests {
             span: Span { start: 0, end: 0 },
             value: Arc::from("hello"),
         };
-        let symbol_value = Value::Symbol {
-            span: Span { start: 0, end: 0 },
-            value: interner::intern_sym("hello"),
-            meta: None,
-        };
+        let symbol_value = value::symbol(
+            interner::intern_sym("hello"),
+            None,
+            None,
+            Span { start: 0, end: 0 },
+        );
         let list = List::new()
             .prepend(int_value.clone())
             .prepend(string_value.clone())

@@ -141,7 +141,54 @@ impl fmt::Display for SyntaxError {
 }
 
 //===----------------------------------------------------------------------===//
-// ErrorWithSpan
+// Errors with Span metadata
+//===----------------------------------------------------------------------===//
+
+/// Carries an [`Error`] together with the byte range (`Span`) where it was produced.
+///
+/// This is the lightweight building block that the evaluator, reader, and other
+/// subsystems can use before an error is upgraded into a fully fledged
+/// [`Diagnostic`].  Holding onto the raw span early lets us defer decisions about
+/// formatting or additional context until the caller is ready to report the
+/// problem.
+#[derive(Debug, Clone)]
+pub struct SpannedError {
+    /// The underlying language error that occurred.
+    pub error: Error,
+    /// Span identifying the source location that triggered the error.
+    pub span: Span,
+}
+
+impl SpannedError {
+    /// Creates a new [`SpannedError`] associating `error` with `span`.
+    ///
+    /// Most call-sites should prefer [`error_at`] for improved readability.
+    pub fn new(error: Error, span: Span) -> Self {
+        Self { error, span }
+    }
+}
+
+/// Convenience function for pairing an [`Error`] with its source `span`.
+///
+/// # Examples
+///
+/// ```
+/// use evolve::error::{error_at, Error};
+/// use evolve::reader::Span;
+///
+/// let span = Span { start: 10, end: 15 };
+/// let err = error_at(span.clone(), Error::RuntimeError("oh no".into()));
+/// assert_eq!(err.span, span);
+/// ```
+pub fn error_at(span: Span, error: Error) -> SpannedError {
+    SpannedError::new(error, span)
+}
+
+/// Result type alias that carries a [`SpannedError`] on failure.
+pub type SpannedResult<T> = Result<T, SpannedError>;
+
+//===----------------------------------------------------------------------===//
+// Diagnostics
 //===----------------------------------------------------------------------===//
 
 /// A wrapper around an error that includes a span, source, file, and optional secondary spans and notes.

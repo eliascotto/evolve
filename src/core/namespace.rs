@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::collections::Map;
+use crate::core::Var;
 use crate::interner;
 use crate::interner::{NsId, SymId};
-use crate::core::Var;
 use once_cell::sync::Lazy;
 
 #[derive(Debug, Clone)]
@@ -27,6 +27,17 @@ impl Namespace {
 
     pub fn get(&self, sym: SymId) -> Option<&Arc<Var>> {
         self.bindings.get(&sym)
+    }
+
+    pub fn id(&self) -> NsId {
+        self.id
+    }
+}
+
+impl PartialEq for Namespace {
+    fn eq(&self, other: &Self) -> bool {
+        // Two namespaces are equal if they have the same ID
+        self.id == other.id
     }
 }
 

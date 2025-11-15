@@ -24,14 +24,13 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
             write!(result, "String:\"{}\"", escaped).unwrap();
         }
-        Value::Symbol { span: _, value: s, meta: _ } => {
-            write!(result, "Symbol:{}", interner::sym_to_str(*s)).unwrap()
+        Value::Symbol { span: _, value, .. } => {
+            write!(result, "Symbol:{}", interner::sym_to_str(value.id())).unwrap()
         }
         Value::Keyword { span: _, value: k } => {
             write!(result, "Keyword:{}", interner::kw_to_str(*k)).unwrap()
         }
         Value::List { span: _, value: items, meta: _ } => {
-            write!(result, "List:").unwrap();
             write!(result, "(").unwrap();
             if items.is_empty() {
                 write!(result, ")").unwrap();
@@ -161,7 +160,7 @@ mod tests {
     use super::*;
     use crate::collections::{List, Map, Set, Vector};
     use crate::reader::Span;
-    use crate::value::Value;
+    use crate::value::{self, Value};
     use std::sync::Arc;
 
     #[test]
@@ -298,19 +297,21 @@ mod tests {
     #[test]
     fn test_pretty_print_symbol() {
         assert_eq!(
-            pretty_print_ast(&Value::Symbol {
-                span: Span { start: 0, end: 0 },
-                value: interner::intern_sym("foo"),
-                meta: None,
-            }),
+            pretty_print_ast(&value::symbol(
+                interner::intern_sym("foo"),
+                None,
+                None,
+                Span { start: 0, end: 0 },
+            )),
             "Symbol:foo"
         );
         assert_eq!(
-            pretty_print_ast(&Value::Symbol {
-                span: Span { start: 0, end: 0 },
-                value: interner::intern_sym("my-symbol"),
-                meta: None,
-            }),
+            pretty_print_ast(&value::symbol(
+                interner::intern_sym("my-symbol"),
+                None,
+                None,
+                Span { start: 0, end: 0 },
+            )),
             "Symbol:my-symbol"
         );
     }
@@ -340,7 +341,7 @@ mod tests {
             value: Arc::new(List::new()),
             meta: None,
         };
-        assert_eq!(pretty_print_ast(&value), "List:()");
+        assert_eq!(pretty_print_ast(&value), "()");
     }
 
     #[test]
@@ -354,7 +355,7 @@ mod tests {
             ])),
             meta: None,
         };
-        let expected = "List:(\n  Int:1\n  Int:2\n  Int:3\n)";
+        let expected = "(\n  Int:1\n  Int:2\n  Int:3\n)";
         assert_eq!(pretty_print_ast(&value), expected);
     }
 
@@ -375,7 +376,7 @@ mod tests {
             ])),
             meta: None,
         };
-        let expected = "List:(\n  Int:1\n  List:(\n    Int:2\n    Int:3\n  )\n)";
+        let expected = "(\n  Int:1\n  (\n    Int:2\n    Int:3\n  )\n)";
         assert_eq!(pretty_print_ast(&value), expected);
     }
 
@@ -488,11 +489,12 @@ mod tests {
         let value = Value::List {
             span: Span { start: 0, end: 0 },
             value: Arc::new(List::from_iter(vec![
-                Value::Symbol {
-                    span: Span { start: 0, end: 0 },
-                    value: interner::intern_sym("foo"),
-                    meta: None,
-                },
+                value::symbol(
+                    interner::intern_sym("foo"),
+                    None,
+                    None,
+                    Span { start: 0, end: 0 },
+                ),
                 Value::List {
                     span: Span { start: 0, end: 0 },
                     value: Arc::new(List::from_iter(vec![
@@ -517,7 +519,7 @@ mod tests {
             ])),
             meta: None,
         };
-        let expected = "List:(\n  Symbol:foo\n  List:(\n    Int:1\n    Vector:[\n      String:\"hello\"\n      Bool:true\n    ]\n  )\n)";
+        let expected = "(\n  Symbol:foo\n  (\n    Int:1\n    Vector:[\n      String:\"hello\"\n      Bool:true\n    ]\n  )\n)";
         assert_eq!(pretty_print_ast(&value), expected);
     }
 }

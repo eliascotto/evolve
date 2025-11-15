@@ -2,8 +2,8 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use crate::reader::Source;
-use crate::{devtools, error::Diagnostic};
 use crate::runtime::{Runtime, RuntimeRef};
+use crate::{devtools, error::Diagnostic};
 
 pub struct REPL {
     pub print_ast: bool,

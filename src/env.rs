@@ -20,9 +20,9 @@
 use std::sync::Arc;
 
 use crate::collections::{Map, Vector};
-use crate::interner::SymId;
 use crate::core::Var;
 use crate::core::{Namespace, RecurContext};
+use crate::interner::SymId;
 use crate::value::Value;
 
 /// Environment for variable bindings with lexical scoping support.
@@ -63,6 +63,7 @@ impl Env {
         }
     }
 
+    /// Inserts a new namespace into the environment.
     pub fn insert_ns(&self, sym: SymId, var: Arc<Var>) -> Self {
         Self {
             ns: Arc::new(self.ns.insert(sym, var)),
@@ -98,8 +99,8 @@ impl Env {
         let mut iter = bindings.iter();
         while let (Some(param), Some(arg)) = (iter.next(), iter.next()) {
             match param {
-                Value::Symbol { value: sym, .. } => {
-                    new_bindings = new_bindings.insert(*sym, arg.clone());
+                Value::Symbol { value, .. } => {
+                    new_bindings = new_bindings.insert(value.id(), arg.clone());
                 }
                 _ => {
                     // Invalid binding - param must be a symbol

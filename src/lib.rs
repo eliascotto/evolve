@@ -1,10 +1,11 @@
+pub mod utils;
 pub mod collections;
+pub mod core;
 pub mod devtools;
 pub mod env;
 pub mod error;
 pub mod eval;
 pub mod interner;
-pub mod core;
 pub mod reader;
 pub mod repl;
 pub mod runtime;

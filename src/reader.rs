@@ -2,9 +2,11 @@ use logos::Logos;
 use std::{fmt, path, sync::Arc};
 
 use crate::collections::{List, Map, Set, Vector};
+use crate::core::Symbol;
 use crate::error::{Diagnostic, Error, SyntaxError};
 use crate::interner::{self, SymId};
 use crate::runtime::{Runtime, RuntimeRef};
+use crate::utils;
 use crate::value::{self, Value};
 
 pub type Span = logos::Span;
@@ -191,8 +193,6 @@ pub struct Reader {
     position: usize,
     /// The file source of the source code, a file or the REPL.
     file: Source,
-    /// A runtime instance reference.
-    runtime: Arc<Runtime>,
     /// A syntax quote reader instance.
     syntax_quote_reader: SyntaxQuoteReader,
 }
@@ -233,7 +233,6 @@ impl Reader {
             source: source_code.to_string(),
             position: 0,
             file: file,
-            runtime: runtime.clone(),
             syntax_quote_reader: SyntaxQuoteReader::new(runtime),
         }
     }
@@ -300,33 +299,41 @@ impl Reader {
                 "false" => {
                     Ok(Value::Bool { span: token_ast.span.clone(), value: false })
                 }
+                // Ordinary symbol
                 _ => {
-                    let sym_id = interner::intern_sym(symbol.as_str());
+                    // Create a symbol to get its id and namespace
+                    let symbol = Symbol::new(symbol.as_str());
+                    // Then return the symbol as a Value
                     Ok(Value::Symbol {
                         span: token_ast.span.clone(),
-                        value: sym_id,
-                        meta: None,
+                        value: Arc::new(symbol),
                     })
                 }
             },
+
             Token::Keyword(keyword) => {
                 let kw_id = interner::intern_kw(keyword.as_str());
                 Ok(Value::Keyword { span: token_ast.span.clone(), value: kw_id })
             }
+
             Token::Int(int) => {
                 Ok(Value::Int { span: token_ast.span.clone(), value: int.clone() })
             }
+
             Token::Float(float) => Ok(Value::Float {
                 span: token_ast.span.clone(),
                 value: float.clone(),
             }),
+
             Token::Str(str) => Ok(Value::String {
                 span: token_ast.span.clone(),
                 value: Arc::from(str.clone()),
             }),
+
             Token::Char(char) => {
                 Ok(Value::Char { span: token_ast.span.clone(), value: char.clone() })
             }
+
             Token::UnterminatedStr(_) => Err(Diagnostic {
                 error: Error::SyntaxError(SyntaxError::UnterminatedString),
                 span: token_ast.span.clone(),
@@ -337,6 +344,7 @@ impl Reader {
                     "add a closing `\"` to terminate the string".to_string(),
                 ]),
             }),
+
             _ => Err(Diagnostic {
                 error: Error::SyntaxError(SyntaxError::UnexpectedToken {
                     found: format!("{}", token_ast.token),
@@ -497,11 +505,12 @@ impl Reader {
                 Ok(Value::List {
                     span: quote_span.clone(),
                     value: Arc::new(List::from_iter(vec![
-                        Value::Symbol {
-                            span: quote_span,
-                            value: interner::intern_sym("quote"),
-                            meta: None,
-                        },
+                        value::symbol(
+                            interner::intern_sym("quote"),
+                            None,
+                            None,
+                            quote_span,
+                        ),
                         self.read_form()?,
                     ])),
                     meta: None,
@@ -510,20 +519,9 @@ impl Reader {
 
             // --------- ` ---------
             Token::Backtick => {
-                let backtick_span = token_ast.span.clone();
                 let _ = self.next()?;
-                Ok(Value::List {
-                    span: backtick_span.clone(),
-                    value: Arc::new(List::from_iter(vec![
-                        Value::Symbol {
-                            span: backtick_span.clone(),
-                            value: interner::intern_sym("syntax-quote"),
-                            meta: None,
-                        },
-                        self.read_form()?,
-                    ])),
-                    meta: None,
-                })
+                let form = self.read_form()?;
+                Ok(self.syntax_quote_reader.syntax_quote(&form))
             }
 
             // --------- ~ ---------
@@ -533,11 +531,12 @@ impl Reader {
                 Ok(Value::List {
                     span: tilde_span.clone(),
                     value: Arc::new(List::from_iter(vec![
-                        Value::Symbol {
-                            span: tilde_span.clone(),
-                            value: interner::intern_sym("unquote"),
-                            meta: None,
-                        },
+                        value::symbol(
+                            interner::intern_sym("unquote"),
+                            None,
+                            None,
+                            tilde_span.clone(),
+                        ),
                         self.read_form()?,
                     ])),
                     meta: None,
@@ -551,11 +550,12 @@ impl Reader {
                 Ok(Value::List {
                     span: tilde_at_span.clone(),
                     value: Arc::new(List::from_iter(vec![
-                        Value::Symbol {
-                            span: tilde_at_span.clone(),
-                            value: interner::intern_sym("unquote-splicing"),
-                            meta: None,
-                        },
+                        value::symbol(
+                            interner::intern_sym("unquote-splicing"),
+                            None,
+                            None,
+                            tilde_at_span.clone(),
+                        ),
                         self.read_form()?,
                     ])),
                     meta: None,
@@ -599,11 +599,12 @@ impl Reader {
                             break Ok(Value::List {
                                 span: var_quote_span.clone(),
                                 value: Arc::new(List::from_iter(vec![
-                                    Value::Symbol {
-                                        span: var_quote_span,
-                                        value: interner::intern_sym("var"),
-                                        meta: None,
-                                    },
+                                    value::symbol(
+                                        interner::intern_sym("var"),
+                                        None,
+                                        None,
+                                        var_quote_span,
+                                    ),
                                     self.read_form()?,
                                 ])),
                                 meta: None,
@@ -670,25 +671,163 @@ impl SyntaxQuoteReader {
 
     pub fn syntax_quote(&self, form: &Value) -> Value {
         match form {
-            Value::Symbol { span, value, meta } => {
-                if self.runtime.evaluator.is_special_form(*value) {
-                    return value::list(
-                        span.clone(),
+            Value::Symbol { span, value: sym } => {
+                // Quote special forms (quote def)
+                if self.runtime.evaluator.is_special_form(sym.id()) {
+                    return value::list_from_vec(
                         vec![
                             value::symbol(
-                                span.clone(),
-                                interner::intern_sym("quote"),
+                                self.runtime.evaluator.special_forms.s_quote,
                                 None,
+                                None,
+                                span.clone(),
                             ),
-                            value::symbol(span.clone(), *value, meta.clone()),
+                            value::symbol(
+                                sym.id(),
+                                sym.namespace(),
+                                sym.metadata(),
+                                span.clone(),
+                            ),
                         ],
+                        span.clone(),
                     );
                 }
 
-                form.clone()
+                let gensym_value: Value;
+                // gensym are unqualified symbols that end with "#"
+                if !sym.is_qualified() && sym.name().ends_with("#") {
+                    if let Some(gensym_id) = self.gensyms.get(&sym.id()) {
+                        // gensym is already interned
+                        gensym_value =
+                            value::symbol(*gensym_id, None, None, span.clone());
+                    } else {
+                        // Intern a new symbol: symname__231__auto__
+                        let gensym = format!(
+                            "{}__{}__auto__",
+                            utils::remove_last_char(sym.name()),
+                            self.runtime.next_id()
+                        );
+                        let new_sym = Symbol::new(gensym.as_str());
+                        self.gensyms.insert(sym.id(), new_sym.id());
+                        gensym_value = Value::Symbol {
+                            span: span.clone(),
+                            value: Arc::new(new_sym),
+                        };
+                    }
+                } else {
+                    // Resolve symbol
+                    let mut sym_clone = Arc::as_ref(sym).clone();
+                    let s = self.runtime.resolve_symbol(&mut sym_clone);
+                    gensym_value =
+                        Value::Symbol { span: span.clone(), value: Arc::new(s) };
+                }
+
+                // Quote the gensym
+                value::list_from_vec(
+                    vec![
+                        value::symbol(
+                            self.runtime.evaluator.special_forms.s_quote,
+                            None,
+                            None,
+                            span.clone(),
+                        ),
+                        gensym_value,
+                    ],
+                    span.clone(),
+                )
+            }
+            Value::List { span, value, .. } => {
+                if value.is_empty() {
+                    return form.clone();
+                }
+
+                // (seq (concat chunk1 chunk2 ...))
+                value::list_from_vec(
+                    vec![
+                        value::symbol(
+                            self.runtime.get_native_fn_sym("seq"),
+                            None,
+                            None,
+                            span.clone(),
+                        ),
+                        value::list_from_vec({
+                            let mut concat_args =
+                                vec![value::symbol(
+                                    self.runtime.get_native_fn_sym("concat"),
+                                    None,
+                                    None,
+                                    span.clone(),
+                                )];
+                            concat_args.extend(self.expand_list(&*value.clone()));
+                            concat_args
+                        }, span.clone()),
+                    ],
+                    span.clone(),
+                )
             }
             _ => form.clone(),
         }
+    }
+
+    /// Builds the `(concat ...)` arguments that a syntax-quoted list expands to.
+    /// Plain elements become `(list (syntax-quote elem))`, `~` emits `(list elem)`
+    /// and `~@` injects the spliced form directly.
+    fn expand_list(&self, list: &List<Value>) -> Vec<Value> {
+        let list_sym = self.runtime.get_native_fn_sym("list");
+        let unquote_sym = interner::intern_sym("unquote");
+        let unquote_splicing_sym = interner::intern_sym("unquote-splicing");
+
+        let wrap_in_list = |expr: Value, span: &Span| -> Value {
+            value::list_from_vec(
+                vec![
+                    value::symbol(list_sym, None, None, span.clone()),
+                    expr,
+                ],
+                span.clone(),
+            )
+        };
+
+        let mut acc: Vec<Value> = Vec::with_capacity(list.len());
+
+        for item in list.iter() {
+            let item_span = item.span();
+            let mut handled = false;
+
+            if let Value::List { value: inner, .. } = item {
+                if let Some((head, tail)) = inner.split_first() {
+                    let matches_symbol =
+                        |value: &Value, expected: SymId| -> bool {
+                            matches!(value, Value::Symbol { value: sym, .. } if sym.id() == expected)
+                        };
+
+                    // (~ x) => (list x)
+                    if matches_symbol(head, unquote_sym) {
+                        let expr =
+                            tail.head().cloned().unwrap_or(Value::Nil {
+                                span: item_span.clone(),
+                            });
+                        acc.push(wrap_in_list(expr, &item_span));
+                        handled = true;
+                    }
+                    // (~@ xs) => xs
+                    if !handled && matches_symbol(head, unquote_splicing_sym) {
+                        let expr =
+                            tail.head().cloned().unwrap_or(Value::Nil {
+                                span: item_span.clone(),
+                            });
+                        acc.push(expr);
+                        handled = true;
+                    }
+                }
+            }
+
+            if !handled {
+                // Default case: recursively syntax-quote the element and make it a single-element chunk.
+                acc.push(wrap_in_list(self.syntax_quote(item), &item_span));
+            }
+        }
+
+        acc
     }
 }
 
@@ -758,6 +897,55 @@ mod tests {
 
     fn setup() -> Arc<Runtime> {
         Runtime::new()
+    }
+
+    fn assert_symbol(value: &Value, expected: SymId) {
+        match value {
+            Value::Symbol { value: sym, .. } => {
+                assert_eq!(
+                    sym.id(),
+                    expected,
+                    "expected symbol id {}, got {}",
+                    interner::sym_to_str(expected),
+                    interner::sym_to_str(sym.id())
+                );
+            }
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+    }
+
+    fn as_list<'a>(value: &'a Value) -> &'a List<Value> {
+        match value {
+            Value::List { value: list, .. } => list.as_ref(),
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    fn assert_quoted_symbol_chunk(
+        chunk: &Value,
+        list_sym: SymId,
+        quote_sym: SymId,
+        expected: SymId,
+    ) {
+        let chunk_list = as_list(chunk);
+        let mut chunk_iter = chunk_list.iter();
+        assert_symbol(chunk_iter.next().expect("list symbol"), list_sym);
+        let quoted = chunk_iter.next().expect("quoted form");
+        assert!(chunk_iter.next().is_none(), "chunk should have two elements");
+
+        let quoted_list = as_list(quoted);
+        let mut quoted_iter = quoted_list.iter();
+        assert_symbol(quoted_iter.next().expect("quote symbol"), quote_sym);
+        assert_symbol(quoted_iter.next().expect("quoted symbol"), expected);
+        assert!(quoted_iter.next().is_none(), "quoted form should have two elements");
+    }
+
+    fn assert_unquote_chunk(chunk: &Value, list_sym: SymId, expected: SymId) {
+        let chunk_list = as_list(chunk);
+        let mut chunk_iter = chunk_list.iter();
+        assert_symbol(chunk_iter.next().expect("list symbol"), list_sym);
+        assert_symbol(chunk_iter.next().expect("unquoted symbol"), expected);
+        assert!(chunk_iter.next().is_none(), "chunk should have two elements");
     }
 
     #[test]
@@ -879,7 +1067,7 @@ mod tests {
         let result = Reader::read("my-symbol", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
-                assert_eq!(interner::sym_to_str(value), "my-symbol");
+                assert_eq!(interner::sym_to_str(value.id()), "my-symbol");
             }
             _ => panic!("Expected Symbol, got {:?}", result),
         }
@@ -1117,7 +1305,7 @@ mod tests {
                 assert_eq!(value.len(), 3);
                 match value.get(0) {
                     Some(Value::Symbol { value: v, .. }) => {
-                        assert_eq!(interner::sym_to_str(*v), "a");
+                        assert_eq!(interner::sym_to_str(v.id()), "a");
                     }
                     _ => panic!("Expected Symbol(a)"),
                 }
@@ -1196,7 +1384,7 @@ mod tests {
                 let items: Vec<_> = value.iter().collect();
                 match items[0] {
                     Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "quote");
+                        assert_eq!(interner::sym_to_str(v.id()), "quote");
                     }
                     _ => panic!("Expected quote symbol"),
                 }
@@ -1210,24 +1398,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_backtick() {
-        let result = Reader::read("`symbol", Source::REPL, setup()).unwrap();
-        match result {
-            Value::List { value, .. } => {
-                assert_eq!(value.len(), 2);
-                let items: Vec<_> = value.iter().collect();
-                match items[0] {
-                    Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "syntax-quote");
-                    }
-                    _ => panic!("Expected syntax-quote symbol"),
-                }
-            }
-            _ => panic!("Expected List (syntax-quote form), got {:?}", result),
-        }
-    }
-
-    #[test]
     fn reads_tilde() {
         let result = Reader::read("~symbol", Source::REPL, setup()).unwrap();
         match result {
@@ -1236,7 +1406,7 @@ mod tests {
                 let items: Vec<_> = value.iter().collect();
                 match items[0] {
                     Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "unquote");
+                        assert_eq!(interner::sym_to_str(v.id()), "unquote");
                     }
                     _ => panic!("Expected unquote symbol"),
                 }
@@ -1254,7 +1424,7 @@ mod tests {
                 let items: Vec<_> = value.iter().collect();
                 match items[0] {
                     Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "unquote-splicing");
+                        assert_eq!(interner::sym_to_str(v.id()), "unquote-splicing");
                     }
                     _ => panic!("Expected unquote-splicing symbol"),
                 }
@@ -1272,7 +1442,7 @@ mod tests {
                 let items: Vec<_> = value.iter().collect();
                 match items[0] {
                     Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "var");
+                        assert_eq!(interner::sym_to_str(v.id()), "var");
                     }
                     _ => panic!("Expected var symbol"),
                 }
@@ -1288,7 +1458,7 @@ mod tests {
             Reader::read("#_discard-me keep-me", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
-                assert_eq!(interner::sym_to_str(value), "keep-me");
+                assert_eq!(interner::sym_to_str(value.id()), "keep-me");
             }
             _ => panic!("Expected Symbol(keep-me), got {:?}", result),
         }
@@ -1473,7 +1643,7 @@ mod tests {
                 // Check first element is 'defn'
                 match items[0] {
                     Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "defn");
+                        assert_eq!(interner::sym_to_str(v.id()), "defn");
                     }
                     _ => panic!("Expected Symbol(defn)"),
                 }
@@ -1498,7 +1668,7 @@ mod tests {
                 let items: Vec<_> = value.iter().collect();
                 match items[0] {
                     Value::Symbol { value: v, .. } => {
-                        assert_eq!(interner::sym_to_str(*v), "quote");
+                        assert_eq!(interner::sym_to_str(v.id()), "quote");
                     }
                     _ => panic!("Expected quote symbol"),
                 }
@@ -1546,7 +1716,7 @@ mod tests {
             Reader::read("symbol-with-dashes", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
-                assert_eq!(interner::sym_to_str(value), "symbol-with-dashes");
+                assert_eq!(interner::sym_to_str(value.id()), "symbol-with-dashes");
             }
             _ => panic!("Expected Symbol, got {:?}", result),
         }
@@ -1555,7 +1725,10 @@ mod tests {
             Reader::read("symbol_with_underscores", Source::REPL, setup()).unwrap();
         match result {
             Value::Symbol { value, .. } => {
-                assert_eq!(interner::sym_to_str(value), "symbol_with_underscores");
+                assert_eq!(
+                    interner::sym_to_str(value.id()),
+                    "symbol_with_underscores"
+                );
             }
             _ => panic!("Expected Symbol, got {:?}", result),
         }
@@ -1570,5 +1743,134 @@ mod tests {
             }
             _ => panic!("Expected Keyword, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn syntax_quote_list_wraps_seq_and_concat() {
+        let runtime = setup();
+        let result = Reader::read("`(a b)", Source::REPL, runtime.clone()).unwrap();
+
+        let seq_sym = runtime.get_native_fn_sym("seq");
+        let concat_sym = runtime.get_native_fn_sym("concat");
+        let list_sym = runtime.get_native_fn_sym("list");
+        let quote_sym = runtime.evaluator.special_forms.s_quote;
+        let sym_a = interner::intern_sym("a");
+        let sym_b = interner::intern_sym("b");
+
+        let outer = as_list(&result);
+        let mut outer_iter = outer.iter();
+        assert_symbol(outer_iter.next().expect("seq symbol"), seq_sym);
+        let concat_form = outer_iter.next().expect("concat form");
+        assert!(outer_iter.next().is_none(), "outer form should have two elements");
+
+        let concat_list = as_list(concat_form);
+        let mut concat_iter = concat_list.iter();
+        assert_symbol(concat_iter.next().expect("concat symbol"), concat_sym);
+        let chunks: Vec<_> = concat_iter.collect();
+        assert_eq!(chunks.len(), 2, "expected two chunks for `(a b)`");
+
+        let mut chunk_iter = chunks.into_iter();
+        assert_quoted_symbol_chunk(
+            chunk_iter.next().expect("first chunk"),
+            list_sym,
+            quote_sym,
+            sym_a,
+        );
+        assert_quoted_symbol_chunk(
+            chunk_iter.next().expect("second chunk"),
+            list_sym,
+            quote_sym,
+            sym_b,
+        );
+        assert!(chunk_iter.next().is_none(), "unexpected extra chunk");
+    }
+
+    #[test]
+    fn syntax_quote_handles_unquote() {
+        let runtime = setup();
+        let result = Reader::read("`(a ~b c)", Source::REPL, runtime.clone()).unwrap();
+
+        let seq_sym = runtime.get_native_fn_sym("seq");
+        let concat_sym = runtime.get_native_fn_sym("concat");
+        let list_sym = runtime.get_native_fn_sym("list");
+        let quote_sym = runtime.evaluator.special_forms.s_quote;
+        let sym_a = interner::intern_sym("a");
+        let sym_b = interner::intern_sym("b");
+        let sym_c = interner::intern_sym("c");
+
+        let outer = as_list(&result);
+        let mut outer_iter = outer.iter();
+        assert_symbol(outer_iter.next().expect("seq symbol"), seq_sym);
+        let concat_form = outer_iter.next().expect("concat form");
+        assert!(outer_iter.next().is_none(), "outer form should have two elements");
+
+        let concat_list = as_list(concat_form);
+        let mut concat_iter = concat_list.iter();
+        assert_symbol(concat_iter.next().expect("concat symbol"), concat_sym);
+        let chunks: Vec<_> = concat_iter.collect();
+        assert_eq!(chunks.len(), 3, "expected three chunks for `(a ~b c)`");
+
+        let mut chunk_iter = chunks.into_iter();
+        assert_quoted_symbol_chunk(
+            chunk_iter.next().expect("first chunk"),
+            list_sym,
+            quote_sym,
+            sym_a,
+        );
+        assert_unquote_chunk(
+            chunk_iter.next().expect("unquote chunk"),
+            list_sym,
+            sym_b,
+        );
+        assert_quoted_symbol_chunk(
+            chunk_iter.next().expect("last chunk"),
+            list_sym,
+            quote_sym,
+            sym_c,
+        );
+        assert!(chunk_iter.next().is_none(), "unexpected extra chunk");
+    }
+
+    #[test]
+    fn syntax_quote_handles_unquote_splicing() {
+        let runtime = setup();
+        let result =
+            Reader::read("`(a ~@b c)", Source::REPL, runtime.clone()).unwrap();
+
+        let seq_sym = runtime.get_native_fn_sym("seq");
+        let concat_sym = runtime.get_native_fn_sym("concat");
+        let list_sym = runtime.get_native_fn_sym("list");
+        let quote_sym = runtime.evaluator.special_forms.s_quote;
+        let sym_a = interner::intern_sym("a");
+        let sym_b = interner::intern_sym("b");
+        let sym_c = interner::intern_sym("c");
+
+        let outer = as_list(&result);
+        let mut outer_iter = outer.iter();
+        assert_symbol(outer_iter.next().expect("seq symbol"), seq_sym);
+        let concat_form = outer_iter.next().expect("concat form");
+        assert!(outer_iter.next().is_none(), "outer form should have two elements");
+
+        let concat_list = as_list(concat_form);
+        let mut concat_iter = concat_list.iter();
+        assert_symbol(concat_iter.next().expect("concat symbol"), concat_sym);
+        let chunks: Vec<_> = concat_iter.collect();
+        assert_eq!(chunks.len(), 3, "expected three chunks for `(a ~@b c)`");
+
+        let mut chunk_iter = chunks.into_iter();
+        assert_quoted_symbol_chunk(
+            chunk_iter.next().expect("first chunk"),
+            list_sym,
+            quote_sym,
+            sym_a,
+        );
+        assert_symbol(chunk_iter.next().expect("spliced chunk"), sym_b);
+        assert_quoted_symbol_chunk(
+            chunk_iter.next().expect("last chunk"),
+            list_sym,
+            quote_sym,
+            sym_c,
+        );
+        assert!(chunk_iter.next().is_none(), "unexpected extra chunk");
     }
 }

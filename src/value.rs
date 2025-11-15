@@ -6,12 +6,12 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::collections::{List, Map, Set, Vector};
+use crate::core::native_fns::NativeFn;
+use crate::core::{Metadata, Symbol, Var};
 use crate::env::Env;
 use crate::error::{Error, SyntaxError};
 use crate::interner::{self, KeywId, NsId, SymId};
 use crate::reader::Span;
-use crate::core::{Metadata, Var};
-use crate::core::native_fns::NativeFn;
 
 //===----------------------------------------------------------------------===//
 // CST
@@ -45,8 +45,7 @@ pub enum Value {
     },
     Symbol {
         span: Span,
-        value: SymId,
-        meta: Option<Metadata>,
+        value: Arc<Symbol>,
     },
     Keyword {
         span: Span,
@@ -111,52 +110,31 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Nil { span: _ }, Value::Nil { span: _ }) => true,
-            (
-                Value::Bool { span: _, value: a },
-                Value::Bool { span: _, value: b },
-            ) => a == b,
-            (
-                Value::Char { span: _, value: a },
-                Value::Char { span: _, value: b },
-            ) => a == b,
-            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => {
-                a == b
-            }
-            (
-                Value::Float { span: _, value: a },
-                Value::Float { span: _, value: b },
-            ) => {
+            (Value::Bool { value: a, .. }, Value::Bool { value: b, .. }) => a == b,
+            (Value::Char { value: a, .. }, Value::Char { value: b, .. }) => a == b,
+            (Value::Int { value: a, .. }, Value::Int { value: b, .. }) => a == b,
+            (Value::Float { value: a, .. }, Value::Float { value: b, .. }) => {
                 // Handle NaN comparison
                 if a.is_nan() && b.is_nan() { true } else { a == b }
             }
-            (
-                Value::String { span: _, value: a },
-                Value::String { span: _, value: b },
-            ) => a == b,
-            (
-                Value::Symbol { span: _, value: a, meta: _ },
-                Value::Symbol { span: _, value: b, meta: _ },
-            ) => a == b,
-            (
-                Value::Keyword { span: _, value: a },
-                Value::Keyword { span: _, value: b },
-            ) => a == b,
-            (
-                Value::List { span: _, value: a, meta: _ },
-                Value::List { span: _, value: b, meta: _ },
-            ) => a == b,
-            (
-                Value::Vector { span: _, value: a, meta: _ },
-                Value::Vector { span: _, value: b, meta: _ },
-            ) => a == b,
-            (
-                Value::Map { span: _, value: a, meta: _ },
-                Value::Map { span: _, value: b, meta: _ },
-            ) => a == b,
-            (
-                Value::Set { span: _, value: a, meta: _ },
-                Value::Set { span: _, value: b, meta: _ },
-            ) => a == b,
+            (Value::String { value: a, .. }, Value::String { value: b, .. }) => {
+                a == b
+            }
+            (Value::Symbol { value: a, .. }, Value::Symbol { value: b, .. }) => {
+                a.id == b.id
+            }
+            (Value::Keyword { value: a, .. }, Value::Keyword { value: b, .. }) => {
+                a == b
+            }
+            (Value::Var { value: a, .. }, Value::Var { value: b, .. }) => {
+                a.symbol == b.symbol && a.ns == b.ns
+            }
+            (Value::List { value: a, .. }, Value::List { value: b, .. }) => a == b,
+            (Value::Vector { value: a, .. }, Value::Vector { value: b, .. }) => {
+                a == b
+            }
+            (Value::Map { value: a, .. }, Value::Map { value: b, .. }) => a == b,
+            (Value::Set { value: a, .. }, Value::Set { value: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -174,21 +152,10 @@ impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Value::Nil { span: _ }, Value::Nil { span: _ }) => Ordering::Equal,
-            (
-                Value::Bool { span: _, value: a },
-                Value::Bool { span: _, value: b },
-            ) => a.cmp(b),
-            (
-                Value::Char { span: _, value: a },
-                Value::Char { span: _, value: b },
-            ) => a.cmp(b),
-            (Value::Int { span: _, value: a }, Value::Int { span: _, value: b }) => {
-                a.cmp(b)
-            }
-            (
-                Value::Float { span: _, value: a },
-                Value::Float { span: _, value: b },
-            ) => {
+            (Value::Bool { value: a, .. }, Value::Bool { value: b, .. }) => a.cmp(b),
+            (Value::Char { value: a, .. }, Value::Char { value: b, .. }) => a.cmp(b),
+            (Value::Int { value: a, .. }, Value::Int { value: b, .. }) => a.cmp(b),
+            (Value::Float { value: a, .. }, Value::Float { value: b, .. }) => {
                 // Handle NaN comparison - NaN is considered less than any other value
                 if a.is_nan() && b.is_nan() {
                     Ordering::Equal
@@ -200,22 +167,16 @@ impl Ord for Value {
                     a.partial_cmp(b).unwrap_or(Ordering::Equal)
                 }
             }
-            (
-                Value::String { span: _, value: a },
-                Value::String { span: _, value: b },
-            ) => a.cmp(b),
-            (
-                Value::Symbol { span: _, value: a, meta: _ },
-                Value::Symbol { span: _, value: b, meta: _ },
-            ) => a.0.cmp(&b.0),
-            (
-                Value::Keyword { span: _, value: a },
-                Value::Keyword { span: _, value: b },
-            ) => a.0.cmp(&b.0),
-            (
-                Value::List { span: _, value: a, meta: _ },
-                Value::List { span: _, value: b, meta: _ },
-            ) => {
+            (Value::String { value: a, .. }, Value::String { value: b, .. }) => {
+                a.cmp(b)
+            }
+            (Value::Symbol { value: a, .. }, Value::Symbol { value: b, .. }) => {
+                a.id.0.cmp(&b.id.0)
+            }
+            (Value::Keyword { value: a, .. }, Value::Keyword { value: b, .. }) => {
+                a.0.cmp(&b.0)
+            }
+            (Value::List { value: a, .. }, Value::List { value: b, .. }) => {
                 let mut a_iter = a.iter();
                 let mut b_iter = b.iter();
                 loop {
@@ -230,10 +191,7 @@ impl Ord for Value {
                     }
                 }
             }
-            (
-                Value::Vector { span: _, value: a, meta: _ },
-                Value::Vector { span: _, value: b, meta: _ },
-            ) => {
+            (Value::Vector { value: a, .. }, Value::Vector { value: b, .. }) => {
                 let mut a_iter = a.iter();
                 let mut b_iter = b.iter();
                 loop {
@@ -248,10 +206,7 @@ impl Ord for Value {
                     }
                 }
             }
-            (
-                Value::Map { span: _, value: a, meta: _ },
-                Value::Map { span: _, value: b, meta: _ },
-            ) => {
+            (Value::Map { value: a, .. }, Value::Map { value: b, .. }) => {
                 let mut a_iter = a.iter();
                 let mut b_iter = b.iter();
                 loop {
@@ -288,8 +243,8 @@ impl Ord for Value {
                 }
             }
             (
-                Value::NativeFunction { span: _, name: a, f: _ },
-                Value::NativeFunction { span: _, name: b, f: _ },
+                Value::NativeFunction { name: a, .. },
+                Value::NativeFunction { name: b, .. },
             ) => a.0.cmp(&b.0),
             _ => Ordering::Equal,
         }
@@ -327,9 +282,9 @@ impl Hash for Value {
                 5u8.hash(state);
                 value.hash(state);
             }
-            Value::Symbol { span: _, value, meta: _ } => {
+            Value::Symbol { value, .. } => {
                 6u8.hash(state);
-                value.hash(state);
+                value.id.hash(state);
             }
             Value::Keyword { span: _, value } => {
                 7u8.hash(state);
@@ -434,9 +389,7 @@ impl fmt::Display for Value {
             Value::Float { span: _, value: val } => format!("{}", val),
             Value::Char { span: _, value: c } => format!("\\{}", c),
             Value::String { span: _, value: s } => s.to_string(),
-            Value::Symbol { span: _, value: sym, meta: _ } => {
-                interner::sym_to_str(*sym)
-            }
+            Value::Symbol { value: sym, .. } => interner::sym_to_str(sym.id),
             Value::Keyword { span: _, value: kw } => interner::kw_print(*kw),
             Value::List { span: _, value: l, meta: _ } => {
                 pr_seq(l.iter(), "(", ")", " ")
@@ -478,34 +431,54 @@ impl fmt::Display for Value {
 }
 
 impl Value {
+    pub fn span(&self) -> Span {
+        match self {
+            Value::Nil { span }
+            | Value::Bool { span, .. }
+            | Value::Char { span, .. }
+            | Value::Int { span, .. }
+            | Value::Float { span, .. }
+            | Value::String { span, .. }
+            | Value::Symbol { span, .. }
+            | Value::Keyword { span, .. }
+            | Value::List { span, .. }
+            | Value::Vector { span, .. }
+            | Value::Map { span, .. }
+            | Value::Set { span, .. }
+            | Value::Namespace { span, .. }
+            | Value::Function { span, .. }
+            | Value::Var { span, .. }
+            | Value::NativeFunction { span, .. }
+            | Value::SpecialForm { span, .. } => span.clone(),
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
-            Value::Nil { span: _ } => "Nil",
-            Value::Bool { span: _, value: _ } => "Bool",
-            Value::Int { span: _, value: _ } => "Int",
-            Value::Float { span: _, value: _ } => "Float",
-            Value::Char { span: _, value: _ } => "Char",
-            Value::String { span: _, value: _ } => "String",
-            Value::Symbol { span: _, value: _, meta: _ } => "Symbol",
-            Value::Keyword { span: _, value: _ } => "Keyword",
-            Value::List { span: _, value: _, meta: _ } => "List",
-            Value::Vector { span: _, value: _, meta: _ } => "Vector",
-            Value::Map { span: _, value: _, meta: _ } => "Map",
-            Value::Set { span: _, value: _, meta: _ } => "Set",
-            Value::Namespace { span: _, value: _ } => "Namespace",
-            Value::Function { span: _, name: _, params: _, body: _, env: _ } => {
-                "Function"
-            }
-            Value::Var { span: _, value: _ } => "Var",
-            Value::NativeFunction { span: _, name: _, f: _ } => "NativeFunction",
-            Value::SpecialForm { span: _, name: _ } => "SpecialForm",
+            Value::Nil { .. } => "Nil",
+            Value::Bool { .. } => "Bool",
+            Value::Int { .. } => "Int",
+            Value::Float { .. } => "Float",
+            Value::Char { .. } => "Char",
+            Value::String { .. } => "String",
+            Value::Symbol { .. } => "Symbol",
+            Value::Keyword { .. } => "Keyword",
+            Value::List { .. } => "List",
+            Value::Vector { .. } => "Vector",
+            Value::Map { .. } => "Map",
+            Value::Set { .. } => "Set",
+            Value::Namespace { .. } => "Namespace",
+            Value::Function { .. } => "Function",
+            Value::Var { .. } => "Var",
+            Value::NativeFunction { .. } => "NativeFunction",
+            Value::SpecialForm { .. } => "SpecialForm",
         }
     }
 
     pub fn get_meta(&self) -> Option<Metadata> {
         match self {
-            Value::Symbol { meta, .. }
-            | Value::List { meta, .. }
+            Value::Symbol { value, .. } => value.metadata(),
+            Value::List { meta, .. }
             | Value::Vector { meta, .. }
             | Value::Map { meta, .. }
             | Value::Set { meta, .. } => meta.clone(),
@@ -514,10 +487,11 @@ impl Value {
     }
 
     pub fn set_meta(&self, meta_def: Value) -> Result<Value, Error> {
-        // Check if this type supports metadata
         let mut meta_map = match self {
-            Value::Symbol { meta, .. }
-            | Value::List { meta, .. }
+            Value::Symbol { value, .. } => {
+                value.metadata().unwrap_or_else(Metadata::new)
+            }
+            Value::List { meta, .. }
             | Value::Vector { meta, .. }
             | Value::Map { meta, .. }
             | Value::Set { meta, .. } => meta.clone().unwrap_or_else(Metadata::new),
@@ -536,7 +510,8 @@ impl Value {
             Value::Keyword { span, value: kw } => {
                 // If meta_def is a Keyword, set its value to true
                 let key = Value::Keyword { span: span.clone(), value: kw };
-                let value = Value::Bool { span: Span { start: 0, end: 0 }, value: true };
+                let value =
+                    Value::Bool { span: Span { start: 0, end: 0 }, value: true };
                 meta_map.insert(key, value);
             }
             Value::Map { span: _, value: hm, meta: _ } => {
@@ -557,10 +532,9 @@ impl Value {
 
         // Create a new Value with the updated metadata
         let result = match self {
-            Value::Symbol { span, value, .. } => Value::Symbol {
+            Value::Symbol { span, value } => Value::Symbol {
                 span: span.clone(),
-                value: *value,
-                meta: Some(meta_map),
+                value: Arc::new(value.as_ref().with_meta(Some(meta_map))),
             },
             Value::List { span, value, .. } => Value::List {
                 span: span.clone(),
@@ -622,16 +596,52 @@ pub fn create_btree_set_from_sequence(seq: Vec<Value>) -> BTreeSet<Value> {
 ///
 /// # Arguments
 ///
-/// * `span` - The span of the list.
 /// * `values` - The values to include in the list.
+/// * `span` - The span of the list.
 ///
 /// # Returns
-pub fn list(span: Span, values: Vec<Value>) -> Value {
+///
+/// A List value.
+pub fn list_from_vec(values: Vec<Value>, span: Span) -> Value {
     Value::List { span: span, value: Arc::new(List::from_iter(values)), meta: None }
 }
 
-pub fn symbol(span: Span, value: SymId, meta: Option<Metadata>) -> Value {
-    Value::Symbol { span: span, value: value, meta: meta }
+/// Creates a list value.
+///
+/// # Arguments
+///
+/// * `list` - The list to include in the value.
+/// * `span` - The span of the list.
+///
+/// # Returns
+/// A list value.
+pub fn list(list: List<Value>, span: Span) -> Value {
+    Value::List { span, value: Arc::new(list), meta: None }
+}
+
+/// Creates a symbol value.
+///
+/// # Arguments
+///
+/// * `span` - The span of the symbol.
+/// * `value` - The SymId of the symbol.
+/// * `ns` - The namespace of the symbol.
+/// * `meta` - The metadata for the symbol.
+///
+/// # Returns
+///
+/// A symbol value.
+pub fn symbol(
+    value: SymId,
+    ns: Option<NsId>,
+    meta: Option<Metadata>,
+    span: Span,
+) -> Value {
+    Value::Symbol { span, value: Arc::new(Symbol::new_with_id(value, ns, meta)) }
+}
+
+pub fn string(value: &str, span: Span) -> Value {
+    Value::String { span, value: Arc::from(value) }
 }
 
 //===----------------------------------------------------------------------===//
@@ -641,7 +651,7 @@ pub fn symbol(span: Span, value: SymId, meta: Option<Metadata>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{namespace, Metadata};
+    use crate::core::{Metadata, namespace};
     use crate::interner;
     use std::collections::BTreeMap;
 
@@ -656,16 +666,12 @@ mod tests {
 
     // Helper function to create a symbol value
     fn sym(s: &str) -> Value {
-        Value::Symbol {
-            span: test_span(),
-            value: interner::intern_sym(s),
-            meta: None,
-        }
+        symbol(interner::intern_sym(s), None, None, test_span())
     }
 
     // Helper function to create a symbol with metadata
     fn sym_with_meta(s: &str, meta: Option<Metadata>) -> Value {
-        Value::Symbol { span: test_span(), value: interner::intern_sym(s), meta }
+        symbol(interner::intern_sym(s), None, meta, test_span())
     }
 
     // Helper function to create an empty list
@@ -674,10 +680,7 @@ mod tests {
     }
 
     // Helper function to create a list with metadata
-    fn list_with_meta(
-        v: Vec<Value>,
-        meta: Option<Metadata>,
-    ) -> Value {
+    fn list_with_meta(v: Vec<Value>, meta: Option<Metadata>) -> Value {
         Value::List { span: test_span(), value: Arc::new(List::from_iter(v)), meta }
     }
 
@@ -687,10 +690,7 @@ mod tests {
     }
 
     // Helper function to create a map with metadata
-    fn map_with_meta(
-        m: BTreeMap<Value, Value>,
-        meta: Option<Metadata>,
-    ) -> Value {
+    fn map_with_meta(m: BTreeMap<Value, Value>, meta: Option<Metadata>) -> Value {
         let mut map = Map::new();
         for (k, v) in m {
             map = map.insert(k, v);
@@ -706,8 +706,7 @@ mod tests {
     fn test_get_meta_supported_types() {
         // Types that support metadata should return Some or None
         let mut meta_map = Metadata::new();
-        meta_map
-            .insert(kw("test"), Value::Bool { span: test_span(), value: true });
+        meta_map.insert(kw("test"), Value::Bool { span: test_span(), value: true });
 
         let sym_with = sym_with_meta("test", Some(meta_map.clone()));
         let sym_without = sym("test");
@@ -857,8 +856,7 @@ mod tests {
     fn test_set_meta_merges_existing() {
         // Setting metadata should merge with existing metadata
         let mut existing_meta = Metadata::new();
-        existing_meta
-            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
+        existing_meta.insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let sym = sym_with_meta("test", Some(existing_meta));
 
         let mut new_meta_map = BTreeMap::new();
@@ -884,8 +882,7 @@ mod tests {
     fn test_set_meta_overwrites_existing_key() {
         // Setting metadata should overwrite existing keys
         let mut existing_meta = Metadata::new();
-        existing_meta
-            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
+        existing_meta.insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let sym = sym_with_meta("test", Some(existing_meta));
 
         let mut new_meta_map = BTreeMap::new();
@@ -915,8 +912,7 @@ mod tests {
     fn test_metadata_preserved_on_clone() {
         // Metadata should be preserved when cloning
         let mut meta_map = Metadata::new();
-        meta_map
-            .insert(kw("test"), Value::Bool { span: test_span(), value: true });
+        meta_map.insert(kw("test"), Value::Bool { span: test_span(), value: true });
         let sym = sym_with_meta("test", Some(meta_map));
 
         let cloned = sym.clone();
@@ -956,13 +952,11 @@ mod tests {
         // Two values with same content but different metadata should be equal
         let sym1 = sym("test");
         let mut meta1 = Metadata::new();
-        meta1
-            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
+        meta1.insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let sym1_with_meta = sym_with_meta("test", Some(meta1));
 
         let mut meta2 = Metadata::new();
-        meta2
-            .insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
+        meta2.insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
         let sym2_with_meta = sym_with_meta("test", Some(meta2));
 
         assert_eq!(sym1, sym1_with_meta);
@@ -1211,16 +1205,14 @@ mod tests {
     fn test_equality_collections_ignore_metadata() {
         // Collections with same content but different metadata should be equal
         let mut meta1 = Metadata::new();
-        meta1
-            .insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
+        meta1.insert(kw("key1"), Value::Int { span: test_span(), value: 1 });
         let list1 = list_with_meta(
             vec![Value::Int { span: test_span(), value: 42 }],
             Some(meta1),
         );
 
         let mut meta2 = Metadata::new();
-        meta2
-            .insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
+        meta2.insert(kw("key2"), Value::Int { span: test_span(), value: 2 });
         let list2 = list_with_meta(
             vec![Value::Int { span: test_span(), value: 42 }],
             Some(meta2),

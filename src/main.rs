@@ -6,8 +6,8 @@ extern crate rustyline;
 use evolve::devtools;
 use evolve::error::{Diagnostic, Error};
 use evolve::reader::Source;
-use evolve::runtime::Runtime;
 use evolve::repl::REPL;
+use evolve::runtime::Runtime;
 use std::{env, fs, path::Path};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

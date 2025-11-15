@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-use crate::collections::{List, Vector};
+use crate::collections::{List, Map, Set, Vector};
 use crate::env::Env;
 use crate::error::{Error, SyntaxError};
-use crate::eval::{Evaluator, make_do_value, synthetic_span};
+use crate::eval::{Evaluator, make_do_value};
 use crate::interner::{self, SymId};
 use crate::value::Value;
+use crate::synthetic_span;
 
 //===----------------------------------------------------------------------===//
 // Native Functions
@@ -24,11 +25,13 @@ impl NativeRegistry {
     pub fn new() -> Self {
         let mut fns = HashMap::new();
         fns.insert(interner::intern_sym("concat"), concat as NativeFn);
+        fns.insert(interner::intern_sym("seq"), seq as NativeFn);
         fns.insert(interner::intern_sym("conj"), conj as NativeFn);
         fns.insert(interner::intern_sym("assoc"), assoc as NativeFn);
         fns.insert(interner::intern_sym("dissoc"), dissoc as NativeFn);
         fns.insert(interner::intern_sym("get"), get as NativeFn);
         fns.insert(interner::intern_sym("count"), count as NativeFn);
+        fns.insert(interner::intern_sym("list"), list as NativeFn);
         fns.insert(interner::intern_sym("macroexpand1"), macroexpand1 as NativeFn);
         fns.insert(interner::intern_sym("macroexpand"), macroexpand as NativeFn);
         Self { fns }
@@ -37,24 +40,110 @@ impl NativeRegistry {
     pub fn resolve(&self, sym: SymId) -> Option<NativeFn> {
         self.fns.get(&sym).copied()
     }
+
+    /// Returns the `SymId` for the native function registered under `name`, if any.
+    ///
+    /// This interns `name` via the global symbol interner and only returns `Some`
+    /// when that symbol corresponds to a registered native function.
+    pub fn sym_for_name(&self, name: &str) -> Option<SymId> {
+        let sym = interner::intern_sym(name);
+        if self.fns.contains_key(&sym) { Some(sym) } else { None }
+    }
 }
 
-/// `(concat & strings)` — concatenates zero or more string values into a single
-/// `String` value.
+/// `(list & items)` — constructs a persistent list containing `items` in order.
 ///
-/// # Errors
+/// Mirrors Clojure's `list`, returning a new list every time (even when empty).
+pub fn list(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    Ok(list_from_iter(args.iter().cloned()))
+}
+
+/// `(seq coll)` — returns a sequence view over `coll`, like Clojure's `seq`.
 ///
-/// Returns a `TypeError` if any argument is not a string.
+/// Returns `nil` when called with `nil` or an empty collection. Works with lists,
+/// vectors, sets, maps (yielding `[k v]` entry vectors), and strings (yielding
+/// chars). Non-seqable values raise a type error.
+pub fn seq(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 1 {
+        return Err(Error::RuntimeError(
+            "seq requires exactly one argument: a collection".to_string(),
+        ));
+    }
+
+    let coll = &args[0];
+    match coll {
+        Value::Nil { .. } => Ok(Value::Nil { span: synthetic_span!() }),
+        Value::List { value: list, .. } => {
+            if list.is_empty() {
+                Ok(Value::Nil { span: synthetic_span!() })
+            } else {
+                Ok(coll.clone())
+            }
+        }
+        Value::Vector { value: vector, .. } => {
+            if vector.is_empty() {
+                Ok(Value::Nil { span: synthetic_span!() })
+            } else {
+                Ok(list_from_iter(vector.iter().cloned()))
+            }
+        }
+        Value::Set { value: set, .. } => {
+            if set.is_empty() {
+                Ok(Value::Nil { span: synthetic_span!() })
+            } else {
+                Ok(list_from_iter(set.iter().cloned()))
+            }
+        }
+        Value::Map { value: map, .. } => {
+            if map.is_empty() {
+                Ok(Value::Nil { span: synthetic_span!() })
+            } else {
+                let entries =
+                    map.iter().map(|(k, v)| map_entry_value(k.clone(), v.clone()));
+                Ok(list_from_iter(entries))
+            }
+        }
+        Value::String { value: s, .. } => {
+            if s.is_empty() {
+                Ok(Value::Nil { span: synthetic_span!() })
+            } else {
+                let chars = s
+                    .chars()
+                    .map(|ch| Value::Char { span: synthetic_span!(), value: ch });
+                Ok(list_from_iter(chars))
+            }
+        }
+        other => Err(type_error("Seqable", other)),
+    }
+}
+
+/// `(concat & colls)` — concatenates zero or more seqable values into a list.
+///
+/// Accepts lists, vectors, sets, or nil. Each collection's elements are appended
+/// in order to produce a new list.
 pub fn concat(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
-    let mut result = String::new();
+    let mut items: Vec<Value> = Vec::new();
     for value in args {
         match value {
-            Value::String { value: s, .. } => result.push_str(s.as_ref()),
-            other => return Err(type_error("String", other)),
+            Value::Nil { .. } => {}
+            Value::List { value: list, .. } => {
+                items.extend(list.iter().cloned());
+            }
+            Value::Vector { value: vector, .. } => {
+                items.extend(vector.iter().cloned());
+            }
+            Value::Set { value: set, .. } => {
+                items.extend(set.iter().cloned());
+            }
+            other => return Err(type_error("Seqable", other)),
         }
     }
 
-    Ok(Value::String { span: synthetic_span(), value: Arc::<str>::from(result) })
+    Ok(Value::List {
+        span: synthetic_span!(),
+        value: Arc::new(List::from_iter(items)),
+        meta: None,
+    })
 }
 
 /// `(conj coll & items)` — inserts the provided items into the given
@@ -265,7 +354,7 @@ pub fn get(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
             if let Some(value) = map.get(key).cloned() {
                 Ok(value)
             } else {
-                Ok(default.unwrap_or_else(|| Value::Nil { span: synthetic_span() }))
+                Ok(default.unwrap_or_else(|| Value::Nil { span: synthetic_span!() }))
             }
         }
         Value::Vector { value: vector, .. } => {
@@ -275,7 +364,7 @@ pub fn get(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
             };
             if index < 0 {
                 return Ok(
-                    default.unwrap_or_else(|| Value::Nil { span: synthetic_span() })
+                    default.unwrap_or_else(|| Value::Nil { span: synthetic_span!() })
                 );
             }
 
@@ -288,7 +377,7 @@ pub fn get(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
             if let Some(value) = vector.get(index).cloned() {
                 Ok(value)
             } else {
-                Ok(default.unwrap_or_else(|| Value::Nil { span: synthetic_span() }))
+                Ok(default.unwrap_or_else(|| Value::Nil { span: synthetic_span!() }))
             }
         }
         other => Err(type_error("Map or Vector", other)),
@@ -326,7 +415,7 @@ pub fn count(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
         Error::RuntimeError("collection length exceeds supported range".to_string())
     })?;
 
-    Ok(Value::Int { span: synthetic_span(), value: int_value })
+    Ok(Value::Int { span: synthetic_span!(), value: int_value })
 }
 
 /// `(macroexpand1 form)` — expands the first macro in the form.
@@ -350,7 +439,7 @@ pub fn macroexpand1(args: &[Value], env: &mut Env) -> Result<Value, Error> {
 
             let maybe_macro_var = match &head {
                 Value::Var { value: var, .. } => Some(var.clone()),
-                Value::Symbol { value: sym, .. } => env.ns.get(*sym).cloned(),
+                Value::Symbol { value: sym, .. } => env.ns.get(sym.id()).cloned(),
                 _ => return Ok(head.clone()),
             };
 
@@ -374,6 +463,7 @@ pub fn macroexpand1(args: &[Value], env: &mut Env) -> Result<Value, Error> {
                     let macro_fn = macro_value.clone();
                     drop(macro_value);
 
+                    let macro_span = macro_fn.span();
                     let (params, body, macro_env) = match macro_fn {
                         Value::Function { params, body, env: fn_env, .. } => {
                             (params, body, fn_env)
@@ -386,7 +476,8 @@ pub fn macroexpand1(args: &[Value], env: &mut Env) -> Result<Value, Error> {
                         }
                     };
 
-                    let provided_args: Vec<Value> = macro_args.iter().cloned().collect();
+                    let provided_args: Vec<Value> =
+                        macro_args.iter().cloned().collect();
                     if params.len() != provided_args.len() {
                         return Err(Error::SyntaxError(
                             SyntaxError::WrongArgumentCount {
@@ -413,10 +504,17 @@ pub fn macroexpand1(args: &[Value], env: &mut Env) -> Result<Value, Error> {
                     // Create a new evaluator to evaluate the macro body.
                     let evaluator = Evaluator::new();
                     // Create a do value for the macro body.
-                    let body_form = make_do_value(&evaluator, body.clone());
+                    let body_form =
+                        make_do_value(&evaluator, body.clone(), macro_span.clone());
                     // Evaluate the macro body.
-                    let expansion_form =
-                        evaluator.eval(&body_form, &mut macro_scope_env)?;
+                    let expansion_form = evaluator
+                        .eval(&body_form, &mut macro_scope_env)
+                        .map_err(|eval_err| {
+                            Error::RuntimeError(format!(
+                                "macroexpand evaluation failed at {:?}: {}",
+                                eval_err.span, eval_err.error
+                            ))
+                        })?;
 
                     // Return the expanded form.
                     Ok(expansion_form)
@@ -439,15 +537,69 @@ pub fn macroexpand(args: &[Value], env: &mut Env) -> Result<Value, Error> {
                 .to_string(),
         ));
     }
-    
-    let mut expanded = macroexpand1(args, env)?;
-    while let Value::List { value: list, .. } = &expanded {
-        if list.is_empty() {
+
+    macroexpand_all(&args[0], env)
+}
+
+fn macroexpand_all(form: &Value, env: &mut Env) -> Result<Value, Error> {
+    let mut expanded = form.clone();
+    loop {
+        let next = macroexpand1(&[expanded.clone()], env)?;
+        if next == expanded {
             break;
         }
-        expanded = macroexpand1(&[expanded], env)?;
+        expanded = next;
     }
-    Ok(expanded)
+
+    match expanded {
+        Value::List { span, value, meta } => {
+            let mut items = Vec::with_capacity(value.len());
+            for item in value.iter() {
+                items.push(macroexpand_all(item, env)?);
+            }
+            Ok(Value::List {
+                span,
+                value: Arc::new(List::from_iter(items)),
+                meta,
+            })
+        }
+        Value::Vector { span, value, meta } => {
+            let mut items = Vec::with_capacity(value.len());
+            for item in value.iter() {
+                items.push(macroexpand_all(item, env)?);
+            }
+            Ok(Value::Vector {
+                span,
+                value: Arc::new(Vector::from_iter(items)),
+                meta,
+            })
+        }
+        Value::Map { span, value, meta } => {
+            let mut entries = Vec::with_capacity(value.len());
+            for (key, val) in value.iter() {
+                let expanded_key = macroexpand_all(key, env)?;
+                let expanded_val = macroexpand_all(val, env)?;
+                entries.push((expanded_key, expanded_val));
+            }
+            Ok(Value::Map {
+                span,
+                value: Arc::new(Map::from_iter(entries)),
+                meta,
+            })
+        }
+        Value::Set { span, value, meta } => {
+            let mut items = Vec::with_capacity(value.len());
+            for item in value.iter() {
+                items.push(macroexpand_all(item, env)?);
+            }
+            Ok(Value::Set {
+                span,
+                value: Arc::new(Set::from_iter(items)),
+                meta,
+            })
+        }
+        other => Ok(other),
+    }
 }
 
 //===----------------------------------------------------------------------===//
@@ -458,5 +610,42 @@ fn type_error(expected: &str, actual: &Value) -> Error {
     Error::TypeError {
         expected: expected.to_string(),
         actual: actual.as_str().to_string(),
+    }
+}
+
+fn list_from_iter<I>(iter: I) -> Value
+where
+    I: IntoIterator<Item = Value>,
+{
+    Value::List {
+        span: synthetic_span!(),
+        value: Arc::new(List::from_iter(iter)),
+        meta: None,
+    }
+}
+
+fn map_entry_value(key: Value, value: Value) -> Value {
+    Value::Vector {
+        span: synthetic_span!(),
+        value: Arc::new(Vector::from_iter(vec![key, value])),
+        meta: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sym_for_name_returns_registered_symbol() {
+        let registry = NativeRegistry::new();
+        let seq_sym = registry.sym_for_name("seq").expect("seq should be registered");
+        assert!(registry.resolve(seq_sym).is_some());
+    }
+
+    #[test]
+    fn sym_for_name_returns_none_for_unknown_function() {
+        let registry = NativeRegistry::new();
+        assert!(registry.sym_for_name("not-a-native").is_none());
     }
 }
