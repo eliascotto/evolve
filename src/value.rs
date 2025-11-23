@@ -391,8 +391,7 @@ impl fmt::Display for Value {
             Value::String { span: _, value: s } => s.to_string(),
             Value::Symbol { value: sym, .. } => {
                 if sym.is_qualified() {
-                    println!("qualified ns: {}", sym.namespace());
-                    format!("{}:{}", sym.namespace(), sym.name())
+                    format!("{}/{}", sym.namespace(), sym.name())
                 } else {
                     format!("{}", sym.name())
                 }

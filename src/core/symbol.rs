@@ -16,9 +16,16 @@ pub struct Symbol {
 impl Symbol {
     pub fn new(symbol_str: &str) -> Self {
         // Extract the namespace from the symbol string, and create a ns symbol
-        let ns = symbol_str.split('/').next().map(|ns| interner::intern_ns(ns));
+        let mut ns = None;
+
+        if let Some((before, _)) = symbol_str.split_once('/') {
+            if !before.is_empty() {
+                ns = Some(interner::intern_ns(before));
+            }
+        }
+
         let sym_id = interner::intern_sym(symbol_str);
-        
+
         Self { id: sym_id, ns, name: Some(symbol_str.to_string()), meta: None }
     }
 
