@@ -8,6 +8,6 @@ pub fn remove_last_char(s: String) -> String {
 #[macro_export]
 macro_rules! synthetic_span {
     () => {
-        crate::reader::Span { start: 0, end: 0 }
+        crate::reader::Span::new(0, 0)
     };
 }

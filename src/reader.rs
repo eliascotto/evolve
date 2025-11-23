@@ -1,5 +1,5 @@
 use logos::Logos;
-use std::{fmt, path, sync::Arc};
+use std::{fmt, ops::Range, path, sync::Arc};
 
 use crate::collections::{List, Map, Set, Vector};
 use crate::core::Symbol;
@@ -9,7 +9,33 @@ use crate::runtime::{Runtime, RuntimeRef};
 use crate::utils;
 use crate::value::{self, Value};
 
-pub type Span = logos::Span;
+#[derive(Debug, PartialEq, Clone)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Span {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    pub fn from_range(span: Range<usize>) -> Self {
+        Self::new(span.start, span.end)
+    }
+
+    pub fn to_range(&self) -> Range<usize> {
+        self.start..self.end
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn shift(&self, offset: usize) -> Self {
+        Self::new(self.start + offset, self.end + offset)
+    }
+}
 
 //===----------------------------------------------------------------------===//
 // Source
@@ -222,7 +248,7 @@ impl Reader {
 
                 tokens.push(TokenCST {
                     token,
-                    span: lexer.span(),
+                    span: Span::from_range(lexer.span()),
                     file: file.clone(),
                 });
             }
@@ -669,110 +695,118 @@ impl SyntaxQuoteReader {
         Self { gensyms: Map::new(), runtime }
     }
 
-    pub fn syntax_quote(&self, form: &Value) -> Value {
+    pub fn syntax_quote(&mut self, form: &Value) -> Value {
         match form {
             Value::Symbol { span, value: sym } => {
                 // Quote special forms (quote def)
                 if self.runtime.evaluator.is_special_form(sym.id()) {
-                    return value::list_from_vec(
-                        vec![
-                            value::symbol(
-                                self.runtime.evaluator.special_forms.s_quote,
-                                None,
-                                None,
-                                span.clone(),
-                            ),
-                            value::symbol(
-                                sym.id(),
-                                sym.namespace(),
-                                sym.metadata(),
-                                span.clone(),
-                            ),
-                        ],
-                        span.clone(),
+                    return self.make_quote_list(
+                        value::symbol(
+                            sym.id(),
+                            sym.namespace(),
+                            sym.metadata(),
+                            span.clone(),
+                        ),
+                        span,
                     );
                 }
 
-                let gensym_value: Value;
-                // gensym are unqualified symbols that end with "#"
-                if !sym.is_qualified() && sym.name().ends_with("#") {
-                    if let Some(gensym_id) = self.gensyms.get(&sym.id()) {
-                        // gensym is already interned
-                        gensym_value =
-                            value::symbol(*gensym_id, None, None, span.clone());
-                    } else {
-                        // Intern a new symbol: symname__231__auto__
-                        let gensym = format!(
-                            "{}__{}__auto__",
-                            utils::remove_last_char(sym.name()),
-                            self.runtime.next_id()
-                        );
-                        let new_sym = Symbol::new(gensym.as_str());
-                        self.gensyms.insert(sym.id(), new_sym.id());
-                        gensym_value = Value::Symbol {
-                            span: span.clone(),
-                            value: Arc::new(new_sym),
-                        };
-                    }
-                } else {
-                    // Resolve symbol
-                    let mut sym_clone = Arc::as_ref(sym).clone();
-                    let s = self.runtime.resolve_symbol(&mut sym_clone);
-                    gensym_value =
-                        Value::Symbol { span: span.clone(), value: Arc::new(s) };
-                }
-
-                // Quote the gensym
-                value::list_from_vec(
-                    vec![
-                        value::symbol(
-                            self.runtime.evaluator.special_forms.s_quote,
-                            None,
-                            None,
-                            span.clone(),
-                        ),
-                        gensym_value,
-                    ],
-                    span.clone(),
-                )
+                let gensym_value = self.handle_symbol(sym, span);
+                self.make_quote_list(gensym_value, span)
             }
             Value::List { span, value, .. } => {
                 if value.is_empty() {
                     return form.clone();
                 }
 
-                // (seq (concat chunk1 chunk2 ...))
-                value::list_from_vec(
-                    vec![
-                        value::symbol(
-                            self.runtime.get_native_fn_sym("seq"),
-                            None,
-                            None,
-                            span.clone(),
-                        ),
-                        value::list_from_vec({
-                            let mut concat_args =
-                                vec![value::symbol(
-                                    self.runtime.get_native_fn_sym("concat"),
-                                    None,
-                                    None,
-                                    span.clone(),
-                                )];
-                            concat_args.extend(self.expand_list(&*value.clone()));
-                            concat_args
-                        }, span.clone()),
-                    ],
-                    span.clone(),
-                )
+                self.make_seq_concat_list(value, span)
             }
             _ => form.clone(),
         }
     }
 
+    /// Creates a `(quote value)` list.
+    fn make_quote_list(&self, value: Value, span: &Span) -> Value {
+        value::list_from_vec(
+            vec![
+                self.quote_symbol(span.clone()),
+                value,
+            ],
+            span.clone(),
+        )
+    }
+
+    /// Creates a symbol for the `quote` special form.
+    fn quote_symbol(&self, span: Span) -> Value {
+        value::symbol(
+            self.runtime.evaluator.special_forms.s_quote,
+            None,
+            None,
+            span,
+        )
+    }
+
+    /// Handles symbol resolution and gensym generation.
+    fn handle_symbol(&mut self, sym: &Arc<Symbol>, span: &Span) -> Value {
+        // Gensyms are unqualified symbols that end with "#"
+        if !sym.is_qualified() && sym.name().ends_with("#") {
+            self.get_or_create_gensym(sym, span)
+        } else {
+            // Resolve symbol
+            let mut sym_clone = Arc::as_ref(sym).clone();
+            let resolved = self.runtime.resolve_symbol(&mut sym_clone);
+            Value::Symbol {
+                span: span.clone(),
+                value: Arc::new(resolved),
+            }
+        }
+    }
+
+    /// Gets an existing gensym or creates a new one.
+    fn get_or_create_gensym(&mut self, sym: &Arc<Symbol>, span: &Span) -> Value {
+        if let Some(gensym_id) = self.gensyms.get(&sym.id()) {
+            // Gensym is already interned
+            value::symbol(*gensym_id, None, None, span.clone())
+        } else {
+            // Intern a new symbol: symname__231__auto__
+            let gensym_name = format!(
+                "{}__{}__auto__",
+                utils::remove_last_char(sym.name()),
+                self.runtime.next_id()
+            );
+            let new_sym = Symbol::new(gensym_name.as_str());
+            self.gensyms = self.gensyms.insert(sym.id(), new_sym.id());
+            Value::Symbol {
+                span: span.clone(),
+                value: Arc::new(new_sym),
+            }
+        }
+    }
+
+    /// Creates a `(seq (concat ...))` list for syntax-quoted lists.
+    fn make_seq_concat_list(&mut self, list: &Arc<List<Value>>, span: &Span) -> Value {
+        let seq_sym = self.runtime.get_native_fn_sym("seq");
+        let concat_sym = self.runtime.get_native_fn_sym("concat");
+
+        let concat_args = {
+            let mut args = vec![value::symbol(concat_sym, None, None, span.clone())];
+            args.extend(self.expand_list(list));
+            args
+        };
+
+        value::list_from_vec(
+            vec![
+                value::symbol(seq_sym, None, None, span.clone()),
+                value::list_from_vec(concat_args, span.clone()),
+            ],
+            span.clone(),
+        )
+    }
+
     /// Builds the `(concat ...)` arguments that a syntax-quoted list expands to.
     /// Plain elements become `(list (syntax-quote elem))`, `~` emits `(list elem)`
     /// and `~@` injects the spliced form directly.
-    fn expand_list(&self, list: &List<Value>) -> Vec<Value> {
+    fn expand_list(&mut self, list: &List<Value>) -> Vec<Value> {
         let list_sym = self.runtime.get_native_fn_sym("list");
         let unquote_sym = interner::intern_sym("unquote");
         let unquote_splicing_sym = interner::intern_sym("unquote-splicing");
@@ -787,47 +821,43 @@ impl SyntaxQuoteReader {
             )
         };
 
-        let mut acc: Vec<Value> = Vec::with_capacity(list.len());
+        list.iter()
+            .map(|item| {
+                let item_span = item.span();
+                self.handle_list_item(item, &item_span, unquote_sym, unquote_splicing_sym, &wrap_in_list)
+            })
+            .collect()
+    }
 
-        for item in list.iter() {
-            let item_span = item.span();
-            let mut handled = false;
-
-            if let Value::List { value: inner, .. } = item {
-                if let Some((head, tail)) = inner.split_first() {
-                    let matches_symbol =
-                        |value: &Value, expected: SymId| -> bool {
-                            matches!(value, Value::Symbol { value: sym, .. } if sym.id() == expected)
-                        };
-
+    /// Handles a single item in a syntax-quoted list, processing unquote/unquote-splicing.
+    fn handle_list_item(
+        &mut self,
+        item: &Value,
+        item_span: &Span,
+        unquote_sym: SymId,
+        unquote_splicing_sym: SymId,
+        wrap_in_list: &dyn Fn(Value, &Span) -> Value,
+    ) -> Value {
+        if let Value::List { value: inner, .. } = item {
+            if let Some((head, tail)) = inner.split_first() {
+                if head.match_symbol(unquote_sym) {
                     // (~ x) => (list x)
-                    if matches_symbol(head, unquote_sym) {
-                        let expr =
-                            tail.head().cloned().unwrap_or(Value::Nil {
-                                span: item_span.clone(),
-                            });
-                        acc.push(wrap_in_list(expr, &item_span));
-                        handled = true;
-                    }
-                    // (~@ xs) => xs
-                    if !handled && matches_symbol(head, unquote_splicing_sym) {
-                        let expr =
-                            tail.head().cloned().unwrap_or(Value::Nil {
-                                span: item_span.clone(),
-                            });
-                        acc.push(expr);
-                        handled = true;
-                    }
+                    let expr = tail.head().cloned().unwrap_or_else(|| Value::Nil {
+                        span: item_span.clone(),
+                    });
+                    return wrap_in_list(expr, item_span);
                 }
-            }
-
-            if !handled {
-                // Default case: recursively syntax-quote the element and make it a single-element chunk.
-                acc.push(wrap_in_list(self.syntax_quote(item), &item_span));
+                if head.match_symbol(unquote_splicing_sym) {
+                    // (~@ xs) => xs
+                    return tail.head().cloned().unwrap_or_else(|| Value::Nil {
+                        span: item_span.clone(),
+                    });
+                }
             }
         }
 
-        acc
+        // Default case: recursively syntax-quote the element and make it a single-element chunk.
+        wrap_in_list(self.syntax_quote(item), item_span)
     }
 }
 

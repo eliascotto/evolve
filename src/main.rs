@@ -5,7 +5,7 @@ extern crate rustyline;
 
 use evolve::devtools;
 use evolve::error::{Diagnostic, Error};
-use evolve::reader::Source;
+use evolve::reader::{Source, Span};
 use evolve::repl::REPL;
 use evolve::runtime::Runtime;
 use std::{env, fs, path::Path};
@@ -72,7 +72,7 @@ fn run_file(file_path: &str, print_ast: bool) -> Result<(), Diagnostic> {
     let path = Path::new(file_path);
     let source_code = fs::read_to_string(path).map_err(|e| Diagnostic {
         error: Error::RuntimeError(format!("Failed to read file: {}", e)),
-        span: 0..0,
+        span: Span::new(0, 0),
         source: String::new(),
         file: Source::File(path.to_path_buf()),
         secondary_spans: None,

@@ -431,6 +431,7 @@ impl fmt::Display for Value {
 }
 
 impl Value {
+    /// Returns the span of the value.
     pub fn span(&self) -> Span {
         match self {
             Value::Nil { span }
@@ -453,6 +454,7 @@ impl Value {
         }
     }
 
+    /// Returns a string representation of the value type.
     pub fn as_str(&self) -> &'static str {
         match self {
             Value::Nil { .. } => "Nil",
@@ -475,6 +477,7 @@ impl Value {
         }
     }
 
+    /// Gets the metadata for a value.
     pub fn get_meta(&self) -> Option<Metadata> {
         match self {
             Value::Symbol { value, .. } => value.metadata(),
@@ -486,6 +489,7 @@ impl Value {
         }
     }
 
+    /// Sets the metadata for a value.
     pub fn set_meta(&self, meta_def: Value) -> Result<Value, Error> {
         let mut meta_map = match self {
             Value::Symbol { value, .. } => {
@@ -511,7 +515,7 @@ impl Value {
                 // If meta_def is a Keyword, set its value to true
                 let key = Value::Keyword { span: span.clone(), value: kw };
                 let value =
-                    Value::Bool { span: Span { start: 0, end: 0 }, value: true };
+                    Value::Bool { span: Span::new(0, 0), value: true };
                 meta_map.insert(key, value);
             }
             Value::Map { span: _, value: hm, meta: _ } => {
@@ -560,6 +564,11 @@ impl Value {
         };
 
         Ok(result)
+    }
+
+    /// Checks if a value is a symbol with the given SymId.
+    pub fn match_symbol(&self, expected: SymId) -> bool {
+        matches!(self, Value::Symbol { value: sym, .. } if sym.id() == expected)
     }
 }
 
@@ -651,12 +660,13 @@ pub fn string(value: &str, span: Span) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Metadata, namespace};
+    use crate::core::Metadata;
     use crate::interner;
     use std::collections::BTreeMap;
+    use crate::runtime::Runtime;
 
     fn test_span() -> Span {
-        Span { start: 0, end: 0 }
+        Span::new(0, 0)
     }
 
     // Helper function to create a keyword value
@@ -723,6 +733,7 @@ mod tests {
 
     #[test]
     fn test_get_meta_unsupported_types() {
+        let runtime = Runtime::new();
         // Types that don't support metadata should return None
         let nil = Value::Nil { span: test_span() };
         let bool_val = Value::Bool { span: test_span(), value: true };
@@ -745,7 +756,7 @@ mod tests {
             name: Some(interner::intern_sym("test")),
             params: Arc::new(Vector::new()),
             body: Arc::new(List::new()),
-            env: Arc::new(Env::new(namespace::ns_find_or_create("test-ns"))),
+            env: Arc::new(Env::new(runtime.find_or_create_namespace("test-ns"))),
         };
 
         assert!(nil.get_meta().is_none());

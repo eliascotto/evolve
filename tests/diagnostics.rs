@@ -6,7 +6,7 @@ fn undefined_symbol_reports_source_span() {
     let runtime = Runtime::new();
     let error = runtime.clone().rep("(foo)", Source::REPL).unwrap_err();
 
-    assert_eq!(error.span, 1..4);
+    assert_eq!(error.span.to_range(), 1..4);
     match error.error {
         evolve::error::Error::RuntimeError(msg) => {
             assert!(msg.contains("Undefined symbol"));
@@ -20,7 +20,7 @@ fn special_form_argument_error_uses_form_span() {
     let runtime = Runtime::new();
     let error = runtime.clone().rep("(if)", Source::REPL).unwrap_err();
 
-    assert_eq!(error.span, 0..4);
+    assert_eq!(error.span.to_range(), 0..4);
     match error.error {
         evolve::error::Error::SyntaxError(_) => {}
         other => panic!("Expected syntax error, got {:?}", other),

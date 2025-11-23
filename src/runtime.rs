@@ -1,19 +1,21 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::core::namespace;
+use crate::core::Symbol;
+use crate::core::namespace::{Namespace, NamespaceRegistry};
 use crate::env::Env;
 use crate::error::{Diagnostic, SpannedError};
 use crate::eval::Evaluator;
+use crate::interner::NsId;
+use crate::interner::SymId;
 use crate::reader::{Reader, Source};
 use crate::value::Value;
-use crate::core::Symbol;
-use crate::interner::SymId;
 
 pub type RuntimeRef = Arc<Runtime>;
 
 #[derive(Debug)]
 pub struct Runtime {
+    namespace_registry: NamespaceRegistry,
     pub evaluator: Evaluator,
     env: Env,
     id: AtomicU32,
@@ -21,11 +23,13 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new() -> Arc<Self> {
+        let namespace_registry = NamespaceRegistry::new();
         // Create the user default namespace and initial environment
-        let user_ns = namespace::ns_find_or_create("user");
+        let user_ns = namespace_registry.find_or_create("user");
         let env = Env::new(user_ns);
 
         Arc::new(Self {
+            namespace_registry,
             evaluator: Evaluator::new(),
             env: env,
             id: AtomicU32::new(0),
@@ -86,6 +90,21 @@ impl Runtime {
 
         sym.set_namespace(self.env.ns.id());
         sym.clone()
+    }
+
+    /// Finds a namespace by its name or creates a new one if it doesn't exist.
+    pub fn find_or_create_namespace(&self, ns_name: &str) -> Arc<Namespace> {
+        self.namespace_registry.find_or_create(ns_name)
+    }
+
+    /// Sets the current namespace.
+    pub fn set_current_namespace(&self, ns: NsId) {
+        self.namespace_registry.set_current(ns);
+    }
+
+    /// Gets the current namespace.
+    pub fn get_current_namespace(&self) -> Arc<Namespace> {
+        self.namespace_registry.get_current()
     }
 }
 

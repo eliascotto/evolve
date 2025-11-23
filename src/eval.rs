@@ -1089,14 +1089,15 @@ pub fn make_do_value(
 mod tests {
     use super::*;
     use crate::collections::List;
-    use crate::core::namespace;
     use crate::core::native_fns::{macroexpand, macroexpand1};
     use crate::value;
+    use crate::runtime::Runtime;
 
     /// Setup a new evaluator and environment for testing.
     fn setup() -> (Evaluator, Env) {
+        let runtime = Runtime::new();
         let eval = Evaluator::new();
-        let ns = namespace::ns_find_or_create("test");
+        let ns = runtime.find_or_create_namespace("test");
         let env = Env::new(ns);
         (eval, env)
     }
@@ -1918,8 +1919,10 @@ mod tests {
     //===----------------------------------------------------------------------===//
 
     #[test]
-    fn test_create_child_with_bindings() {
+    fn test_create_child_with_bindings () {
         let (_eval, env) = setup();
+
+        println!("test_create_child_with_bindings");
 
         // Create bindings: [sym1 val1 sym2 val2]
         let sym1 = interner::intern_sym("x");

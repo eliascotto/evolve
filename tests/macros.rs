@@ -13,7 +13,7 @@ fn eval(runtime: &Arc<Runtime>, form: &str) -> Value {
         .rep(form, Source::REPL)
         .unwrap_or_else(|err| {
             let snippet = if err.span.end <= form.len() {
-                &form[err.span.clone()]
+                &form[err.span.clone().to_range()]
             } else {
                 ""
             };
@@ -132,6 +132,7 @@ fn quasiquote_unquote_and_splice_form_lists() {
         ",
     );
     let items = list_items(&result);
+    // (a 2 3 4)
     assert_eq!(items.len(), 4);
     assert_symbol_name(items[0], "a");
     assert_int(items[1], 2);

@@ -30,7 +30,9 @@ impl REPL {
         if rl.load_history(".evolve-history").is_err() {}
 
         'repl_loop: loop {
-            let readline = rl.readline(&format!("> "));
+            let current_namespace = self.runtime.get_current_namespace();
+            let repl_prompt = format!("{}> ", current_namespace.name);
+            let readline = rl.readline(&repl_prompt);
             match readline {
                 Ok(line) => {
                     if let Err(err) = rl.add_history_entry(line.as_str()) {
