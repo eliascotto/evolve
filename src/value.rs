@@ -389,7 +389,14 @@ impl fmt::Display for Value {
             Value::Float { span: _, value: val } => format!("{}", val),
             Value::Char { span: _, value: c } => format!("\\{}", c),
             Value::String { span: _, value: s } => s.to_string(),
-            Value::Symbol { value: sym, .. } => interner::sym_to_str(sym.id),
+            Value::Symbol { value: sym, .. } => {
+                if sym.is_qualified() {
+                    println!("qualified ns: {}", sym.namespace());
+                    format!("{}:{}", sym.namespace(), sym.name())
+                } else {
+                    format!("{}", sym.name())
+                }
+            },
             Value::Keyword { span: _, value: kw } => interner::kw_print(*kw),
             Value::List { span: _, value: l, meta: _ } => {
                 pr_seq(l.iter(), "(", ")", " ")

@@ -703,7 +703,7 @@ impl SyntaxQuoteReader {
                     return self.make_quote_list(
                         value::symbol(
                             sym.id(),
-                            sym.namespace(),
+                            sym.ns,
                             sym.metadata(),
                             span.clone(),
                         ),

@@ -80,6 +80,7 @@ impl Runtime {
         match self.env.get(sym.id()) {
             Some(value) => match value {
                 Value::Var { value: var, .. } => {
+                    // Use the namespace of the var
                     sym.set_namespace(var.ns.id());
                     return sym.clone();
                 }
@@ -88,7 +89,8 @@ impl Runtime {
             None => {}
         }
 
-        sym.set_namespace(self.env.ns.id());
+        // Default to the current namespace
+        sym.set_namespace(self.get_current_namespace().id());
         sym.clone()
     }
 

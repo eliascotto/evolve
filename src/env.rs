@@ -63,8 +63,9 @@ impl Env {
         }
     }
 
-    /// Inserts a new namespace into the environment.
-    pub fn insert_ns(&self, sym: SymId, var: Arc<Var>) -> Self {
+    /// Defines a variable in the namespace by registering a symbol-to-Var binding.
+    /// Returns a new environment with the updated namespace bindings.
+    pub fn define_var(&self, sym: SymId, var: Arc<Var>) -> Self {
         Self {
             ns: Arc::new(self.ns.insert(sym, var)),
             bindings: self.bindings.clone(),

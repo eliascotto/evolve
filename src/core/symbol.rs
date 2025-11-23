@@ -37,8 +37,8 @@ impl Symbol {
         }
     }
 
-    pub fn namespace(&self) -> Option<NsId> {
-        self.ns
+    pub fn namespace(&self) -> String {
+        interner::ns_to_str(self.ns.unwrap())
     }
 
     pub fn set_namespace(&mut self, ns: NsId) {

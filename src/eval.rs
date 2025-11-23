@@ -547,8 +547,8 @@ impl Evaluator {
         let var_arc = Arc::new(var);
         let var_value = Value::Var { span: sym_span, value: var_arc.clone() };
 
-        // Insert the new namespace
-        let mut new_env = value_env.insert_ns(sym, var_arc);
+        // Define the variable in the namespace
+        let mut new_env = value_env.define_var(sym, var_arc);
         // Set the value in the new environment
         new_env = new_env.set(sym, var_value.clone());
         Ok(Step::Value(var_value, new_env))
@@ -683,7 +683,7 @@ impl Evaluator {
             Var::new(macro_name, env.ns.clone(), Some(func), sym_meta, true, false);
         let var_arc = Arc::new(macro_var);
 
-        let new_env = env.insert_ns(macro_name, var_arc.clone());
+        let new_env = env.define_var(macro_name, var_arc.clone());
         Ok(Step::Value(
             Value::Var { span: macro_name_span, value: var_arc },
             new_env,
@@ -2207,7 +2207,7 @@ mod tests {
 
         let macro_var =
             Var::new(macro_sym, env.ns.clone(), Some(macro_fn), None, true, false);
-        env = env.insert_ns(macro_sym, Arc::new(macro_var));
+        env = env.define_var(macro_sym, Arc::new(macro_var));
 
         // Construct a macro call form: (my-macro (+ 1 2))
         let plus_sym = interner::intern_sym("+");
@@ -2270,7 +2270,7 @@ mod tests {
             true,
             false,
         );
-        env = env.insert_ns(inner_sym, Arc::new(inner_macro_var));
+        env = env.define_var(inner_sym, Arc::new(inner_macro_var));
 
         let outer_sym = interner::intern_sym("outer-macro");
         let inner_call = Value::List {
@@ -2297,7 +2297,7 @@ mod tests {
             true,
             false,
         );
-        env = env.insert_ns(outer_sym, Arc::new(outer_macro_var));
+        env = env.define_var(outer_sym, Arc::new(outer_macro_var));
 
         let macro_call = Value::List {
             span: synthetic_span!(),
