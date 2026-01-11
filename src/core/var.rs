@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::core::{Metadata, Namespace};
-use crate::interner::SymId;
+use crate::interner::{self, SymId};
+use crate::synthetic_span;
 use crate::value::Value;
 
 #[derive(Debug)]
@@ -71,6 +72,49 @@ impl Var {
 
     pub fn is_macro(&self) -> bool {
         self.is_macro.load(Ordering::Relaxed)
+    }
+
+    /// Checks if this var is marked as public via ^:public metadata.
+    /// In Evolve, vars are private by default and must be explicitly marked as public.
+    pub fn is_public(&self) -> bool {
+        if let Some(ref meta) = self.meta {
+            // Check for :public key
+            let public_kw = Value::Keyword {
+                span: synthetic_span!(),
+                value: interner::intern_kw("public"),
+            };
+            if let Some(val) = meta.get(&public_kw) {
+                // If the value is truthy (not nil or false), it's public
+                match val {
+                    Value::Bool { value: false, .. } | Value::Nil { .. } => false,
+                    _ => true,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Checks if this var is marked as private via ^:private metadata.
+    pub fn is_private(&self) -> bool {
+        if let Some(ref meta) = self.meta {
+            let private_kw = Value::Keyword {
+                span: synthetic_span!(),
+                value: interner::intern_kw("private"),
+            };
+            if let Some(val) = meta.get(&private_kw) {
+                match val {
+                    Value::Bool { value: false, .. } | Value::Nil { .. } => false,
+                    _ => true,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 }
 

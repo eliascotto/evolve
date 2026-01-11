@@ -11,6 +11,7 @@ pub struct SpecialFormRegistry {
     pub s_fn: SymId,
     pub s_loop: SymId,
     pub s_recur: SymId,
+    pub s_ns: SymId,
 }
 
 impl SpecialFormRegistry {
@@ -25,6 +26,7 @@ impl SpecialFormRegistry {
             s_fn: interner::intern_sym("fn*"),
             s_loop: interner::intern_sym("loop*"),
             s_recur: interner::intern_sym("recur"),
+            s_ns: interner::intern_sym("ns"),
         }
     }
 }

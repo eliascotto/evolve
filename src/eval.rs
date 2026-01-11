@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::collections::{List, Vector};
 use crate::core::native_fns::NativeRegistry;
-use crate::core::{Metadata, RecurContext, SpecialFormRegistry, Var};
+use crate::core::{Metadata, Namespace, RecurContext, SpecialFormRegistry, Var};
 use crate::env::Env;
 use crate::error::{Error, SpannedResult, SyntaxError, error_at};
 use crate::interner::{self, SymId};
@@ -436,6 +436,9 @@ impl Evaluator {
         }
         if sym == self.special_forms.s_fn {
             return self.eval_fn(args, env, form_span);
+        }
+        if sym == self.special_forms.s_ns {
+            return self.eval_ns(args, env, form_span);
         }
 
         Err(error_at(
@@ -1046,6 +1049,220 @@ impl Evaluator {
         ))
     }
 
+    fn eval_ns(
+        &self,
+        args: List<Value>,
+        _env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        use crate::core::namespace::{find_or_create_ns, set_current_ns, update_ns};
+
+        if args.is_empty() {
+            return Err(error_at(
+                form_span.clone(),
+                Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                    error_str: "ns requires at least a namespace name".to_string(),
+                }),
+            ));
+        }
+
+        // (ns my.namespace ...)
+        // First argument must be a symbol
+        let mut iter = args.iter();
+        let ns_name_value = iter.next().unwrap();
+        let ns_name = match ns_name_value {
+            Value::Symbol { value: sym, .. } => interner::sym_to_str(sym.id()),
+            other => {
+                return Err(error_at(
+                    other.span(),
+                    Error::SyntaxError(SyntaxError::InvalidSymbol {
+                        value: "ns requires a symbol as namespace name".to_string(),
+                    }),
+                ));
+            }
+        };
+
+        // Find or create the namespace
+        let mut ns = find_or_create_ns(&ns_name);
+
+        // Process remaining arguments (require declarations, etc.)
+        for form in iter {
+            match form {
+                Value::List { value: list, .. } => {
+                    if let Some(first) = list.head() {
+                        match first {
+                            Value::Keyword { value: kw, .. } => {
+                                let kw_str = interner::kw_to_str(*kw);
+                                match kw_str.as_str() {
+                                    "require" => {
+                                        // Process :require declarations
+                                        ns = self.process_require(
+                                            Arc::new(ns.as_ref().clone()),
+                                            list.tail().unwrap_or_else(List::new),
+                                            form_span.clone(),
+                                        )?;
+                                    }
+                                    other => {
+                                        return Err(error_at(
+                                            first.span(),
+                                            Error::RuntimeError(format!(
+                                                "Unknown ns directive: :{}",
+                                                other
+                                            )),
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Skip other forms for now
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Skip non-list forms
+                }
+            }
+        }
+
+        // Update the namespace in the registry
+        let ns_arc = Arc::new(ns.as_ref().clone());
+        update_ns(ns_arc.clone());
+
+        // Set as current namespace
+        set_current_ns(ns_arc.id);
+
+        // Create new environment with the new namespace
+        let new_env = Env::new(ns_arc);
+
+        // Return the namespace symbol
+        Ok(Step::Value(ns_name_value.clone(), new_env))
+    }
+
+    fn process_require(
+        &self,
+        mut ns: Arc<Namespace>,
+        specs: List<Value>,
+        form_span: Span,
+    ) -> EvalResult<Arc<Namespace>> {
+        use crate::core::namespace::find_or_create_ns;
+
+        for spec in specs.iter() {
+            match spec {
+                // Simple require: foo.bar
+                Value::Symbol { value: sym, .. } => {
+                    let required_ns_name = interner::sym_to_str(sym.id());
+                    let _required_ns = find_or_create_ns(&required_ns_name);
+                    // Just ensure the namespace exists, no aliasing
+                }
+                // Vector form: [foo.bar :as fb] or [foo.bar :refer [x y z]]
+                Value::Vector { value: vec, .. } => {
+                    if vec.is_empty() {
+                        continue;
+                    }
+
+                    let ns_sym = match vec.get(0) {
+                        Some(Value::Symbol { value: sym, .. }) => sym.id(),
+                        _ => {
+                            return Err(error_at(
+                                spec.span(),
+                                Error::SyntaxError(SyntaxError::InvalidSymbol {
+                                    value: "require spec must start with a symbol"
+                                        .to_string(),
+                                }),
+                            ));
+                        }
+                    };
+
+                    let required_ns_name = interner::sym_to_str(ns_sym);
+                    let required_ns = find_or_create_ns(&required_ns_name);
+
+                    // Process options (:as, :refer)
+                    let mut i = 1;
+                    while i < vec.len() {
+                        let opt = vec.get(i);
+                        match opt {
+                            Some(Value::Keyword { value: kw, .. }) => {
+                                let kw_str = interner::kw_to_str(*kw);
+                                match kw_str.as_str() {
+                                    "as" => {
+                                        // :as alias
+                                        i += 1;
+                                        if let Some(Value::Symbol { value: alias, .. }) =
+                                            vec.get(i)
+                                        {
+                                            let updated_ns =
+                                                ns.add_alias(alias.id(), required_ns.id);
+                                            ns = Arc::new(updated_ns);
+                                        } else {
+                                            return Err(error_at(
+                                                form_span.clone(),
+                                                Error::SyntaxError(
+                                                    SyntaxError::InvalidSymbol {
+                                                        value: ":as requires an alias symbol"
+                                                            .to_string(),
+                                                    },
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    "refer" => {
+                                        // :refer [sym1 sym2 ...]
+                                        i += 1;
+                                        if let Some(Value::Vector { value: refer_vec, .. }) =
+                                            vec.get(i)
+                                        {
+                                            for refer_item in refer_vec.iter() {
+                                                if let Value::Symbol { value: ref_sym, .. } =
+                                                    refer_item
+                                                {
+                                                    // Look up the var in the required namespace
+                                                    if let Some(var) =
+                                                        required_ns.get(ref_sym.id())
+                                                    {
+                                                        let updated_ns = ns
+                                                            .add_refer(ref_sym.id(), var.clone());
+                                                        ns = Arc::new(updated_ns);
+                                                    }
+                                                    // If var not found, silently skip for now
+                                                    // (could error in strict mode)
+                                                }
+                                            }
+                                        } else {
+                                            return Err(error_at(
+                                                form_span.clone(),
+                                                Error::SyntaxError(
+                                                    SyntaxError::WrongArgumentCount {
+                                                        error_str: ":refer requires a vector of symbols".to_string(),
+                                                    },
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        // Unknown option, skip
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    return Err(error_at(
+                        spec.span(),
+                        Error::SyntaxError(SyntaxError::InvalidSymbol {
+                            value: "require spec must be a symbol or vector".to_string(),
+                        }),
+                    ));
+                }
+            }
+        }
+
+        Ok(ns)
+    }
+
     pub fn is_special_form(&self, sym: SymId) -> bool {
         sym == self.special_forms.s_def
             || sym == self.special_forms.s_defmacro
@@ -1056,6 +1273,7 @@ impl Evaluator {
             || sym == self.special_forms.s_loop
             || sym == self.special_forms.s_recur
             || sym == self.special_forms.s_fn
+            || sym == self.special_forms.s_ns
     }
 }
 

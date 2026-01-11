@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::collections::{Map, Vector};
+use crate::core::namespace::update_ns;
 use crate::core::Var;
 use crate::core::{Namespace, RecurContext};
 use crate::interner::SymId;
@@ -65,9 +66,14 @@ impl Env {
 
     /// Defines a variable in the namespace by registering a symbol-to-Var binding.
     /// Returns a new environment with the updated namespace bindings.
+    /// Also persists the namespace change to the global registry.
     pub fn define_var(&self, sym: SymId, var: Arc<Var>) -> Self {
+        let new_ns = Arc::new(self.ns.insert(sym, var));
+        // Persist the namespace change to the global registry
+        // so that other environments using this namespace can see the new binding
+        update_ns(new_ns.clone());
         Self {
-            ns: Arc::new(self.ns.insert(sym, var)),
+            ns: new_ns,
             bindings: self.bindings.clone(),
             parent: self.parent.clone(),
             recur_context: self.recur_context.clone(),

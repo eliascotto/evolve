@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use crate::core::Symbol;
-use crate::core::namespace::{Namespace, NamespaceRegistry};
+use crate::core::namespace::{get_current_ns, Namespace, NamespaceRegistry};
 use crate::env::Env;
 use crate::error::{Diagnostic, SpannedError};
 use crate::eval::Evaluator;
@@ -17,7 +18,8 @@ pub type RuntimeRef = Arc<Runtime>;
 pub struct Runtime {
     namespace_registry: NamespaceRegistry,
     pub evaluator: Evaluator,
-    env: Env,
+    /// The current environment, protected by a mutex for safe mutation
+    env: Mutex<Env>,
     id: AtomicU32,
 }
 
@@ -31,12 +33,13 @@ impl Runtime {
         Arc::new(Self {
             namespace_registry,
             evaluator: Evaluator::new(),
-            env: env,
+            env: Mutex::new(env),
             id: AtomicU32::new(0),
         })
     }
 
-    /// Evaluates the input and returns the result as a string.
+    /// Evaluates the input and returns the result.
+    /// Environment changes (e.g., from `ns` or `def`) are persisted.
     pub fn rep(
         self: Arc<Self>,
         input: &str,
@@ -44,7 +47,17 @@ impl Runtime {
     ) -> Result<Value, Diagnostic> {
         let ast = Reader::read(input, file.clone(), self.clone())?;
 
-        let value = match self.evaluator.eval(&ast, &mut self.env.clone()) {
+        // Get a mutable reference to the current env
+        let mut env = self.env.lock().unwrap().clone();
+
+        // Sync the environment's namespace with the global current namespace
+        // This ensures ns changes from previous rep calls are reflected
+        let current_ns = get_current_ns();
+        if env.ns.id != current_ns.id {
+            env = Env::new(current_ns);
+        }
+
+        let value = match self.evaluator.eval(&ast, &mut env) {
             Ok(value) => value,
             Err(eval_err) => {
                 let SpannedError { error, span } = eval_err;
@@ -58,6 +71,9 @@ impl Runtime {
                 });
             }
         };
+
+        // Persist the environment changes
+        *self.env.lock().unwrap() = env;
 
         Ok(value)
     }
@@ -77,7 +93,8 @@ impl Runtime {
             return sym.clone();
         }
 
-        match self.env.get(sym.id()) {
+        let env = self.env.lock().unwrap();
+        match env.get(sym.id()) {
             Some(value) => match value {
                 Value::Var { value: var, .. } => {
                     // Use the namespace of the var
