@@ -5,6 +5,7 @@ pub mod devtools;
 pub mod env;
 pub mod error;
 pub mod eval;
+pub mod hir;
 pub mod interner;
 pub mod reader;
 pub mod repl;
