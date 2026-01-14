@@ -1,6 +1,8 @@
 pub mod utils;
 #[cfg(feature = "codegen")]
 pub mod codegen;
+#[cfg(feature = "codegen")]
+pub mod codegen_runtime;
 pub mod agent;
 pub mod atom;
 pub mod collections;
