@@ -5,13 +5,17 @@ use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::agent::Agent;
+use crate::atom::Atom;
 use crate::collections::{List, Map, Set, Vector};
+use crate::condition::{Condition, Restart};
 use crate::core::native_fns::NativeFn;
 use crate::core::{Metadata, Symbol, Var};
 use crate::env::Env;
 use crate::error::{Error, SyntaxError};
 use crate::interner::{self, KeywId, NsId, SymId};
 use crate::reader::Span;
+use crate::stm::Ref;
 
 //===----------------------------------------------------------------------===//
 // CST
@@ -104,6 +108,37 @@ pub enum Value {
         span: Span,
         name: SymId,
     },
+    //--------------------------------------------------//
+    // Concurrency primitives
+    //--------------------------------------------------//
+    /// Thread-safe mutable reference with atomic updates
+    Atom {
+        span: Span,
+        value: Arc<Atom>,
+    },
+    /// STM reference for transactional memory
+    Ref {
+        span: Span,
+        value: Arc<Ref>,
+    },
+    /// Asynchronous state with action queue
+    Agent {
+        span: Span,
+        value: Arc<Agent>,
+    },
+    //--------------------------------------------------//
+    // Condition system
+    //--------------------------------------------------//
+    /// A condition (restartable exception)
+    Condition {
+        span: Span,
+        value: Arc<Condition>,
+    },
+    /// A restart point for the condition system
+    Restart {
+        span: Span,
+        value: Arc<Restart>,
+    },
 }
 
 impl PartialEq for Value {
@@ -135,6 +170,23 @@ impl PartialEq for Value {
             }
             (Value::Map { value: a, .. }, Value::Map { value: b, .. }) => a == b,
             (Value::Set { value: a, .. }, Value::Set { value: b, .. }) => a == b,
+            // Concurrency types use pointer equality
+            (Value::Atom { value: a, .. }, Value::Atom { value: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (Value::Ref { value: a, .. }, Value::Ref { value: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (Value::Agent { value: a, .. }, Value::Agent { value: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            // Condition types use pointer equality
+            (Value::Condition { value: a, .. }, Value::Condition { value: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (Value::Restart { value: a, .. }, Value::Restart { value: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
             _ => false,
         }
     }
@@ -246,6 +298,22 @@ impl Ord for Value {
                 Value::NativeFunction { name: a, .. },
                 Value::NativeFunction { name: b, .. },
             ) => a.0.cmp(&b.0),
+            // Concurrency and condition types compare by pointer
+            (Value::Atom { value: a, .. }, Value::Atom { value: b, .. }) => {
+                Arc::as_ptr(a).cmp(&Arc::as_ptr(b))
+            }
+            (Value::Ref { value: a, .. }, Value::Ref { value: b, .. }) => {
+                Arc::as_ptr(a).cmp(&Arc::as_ptr(b))
+            }
+            (Value::Agent { value: a, .. }, Value::Agent { value: b, .. }) => {
+                Arc::as_ptr(a).cmp(&Arc::as_ptr(b))
+            }
+            (Value::Condition { value: a, .. }, Value::Condition { value: b, .. }) => {
+                Arc::as_ptr(a).cmp(&Arc::as_ptr(b))
+            }
+            (Value::Restart { value: a, .. }, Value::Restart { value: b, .. }) => {
+                Arc::as_ptr(a).cmp(&Arc::as_ptr(b))
+            }
             _ => Ordering::Equal,
         }
     }
@@ -342,6 +410,28 @@ impl Hash for Value {
                 16u8.hash(state);
                 name.hash(state);
             }
+            // Concurrency types hash by pointer
+            Value::Atom { span: _, value } => {
+                17u8.hash(state);
+                Arc::as_ptr(value).hash(state);
+            }
+            Value::Ref { span: _, value } => {
+                18u8.hash(state);
+                Arc::as_ptr(value).hash(state);
+            }
+            Value::Agent { span: _, value } => {
+                19u8.hash(state);
+                Arc::as_ptr(value).hash(state);
+            }
+            // Condition types hash by pointer
+            Value::Condition { span: _, value } => {
+                20u8.hash(state);
+                Arc::as_ptr(value).hash(state);
+            }
+            Value::Restart { span: _, value } => {
+                21u8.hash(state);
+                Arc::as_ptr(value).hash(state);
+            }
         }
     }
 }
@@ -431,6 +521,23 @@ impl fmt::Display for Value {
             Value::NativeFunction { span: _, name: n, f: _ } => {
                 format!("#<native-fn:{}>", interner::sym_to_str(*n))
             }
+            // Concurrency types
+            Value::Atom { value, .. } => {
+                format!("#<Atom {}>", value.deref())
+            }
+            Value::Ref { value, .. } => {
+                format!("#<Ref {}>", value.deref())
+            }
+            Value::Agent { value, .. } => {
+                format!("#<Agent {}>", value.deref())
+            }
+            // Condition types
+            Value::Condition { value, .. } => {
+                format!("#<Condition {}>", value.name())
+            }
+            Value::Restart { value, .. } => {
+                format!("#<Restart {}>", value.name())
+            }
         };
         write!(f, "{}", s)
     }
@@ -456,7 +563,12 @@ impl Value {
             | Value::Function { span, .. }
             | Value::Var { span, .. }
             | Value::NativeFunction { span, .. }
-            | Value::SpecialForm { span, .. } => span.clone(),
+            | Value::SpecialForm { span, .. }
+            | Value::Atom { span, .. }
+            | Value::Ref { span, .. }
+            | Value::Agent { span, .. }
+            | Value::Condition { span, .. }
+            | Value::Restart { span, .. } => span.clone(),
         }
     }
 
@@ -480,6 +592,11 @@ impl Value {
             Value::Var { .. } => "Var",
             Value::NativeFunction { .. } => "NativeFunction",
             Value::SpecialForm { .. } => "SpecialForm",
+            Value::Atom { .. } => "Atom",
+            Value::Ref { .. } => "Ref",
+            Value::Agent { .. } => "Agent",
+            Value::Condition { .. } => "Condition",
+            Value::Restart { .. } => "Restart",
         }
     }
 

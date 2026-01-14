@@ -2,11 +2,15 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
+use crate::agent::Agent;
+use crate::atom::Atom;
 use crate::collections::{List, Map, Set, Vector};
+use crate::condition::Condition;
 use crate::env::Env;
 use crate::error::{Error, SyntaxError};
 use crate::eval::{Evaluator, make_do_value};
 use crate::interner::{self, SymId};
+use crate::stm::Ref;
 use crate::value::Value;
 use crate::synthetic_span;
 
@@ -34,6 +38,28 @@ impl NativeRegistry {
         fns.insert(interner::intern_sym("list"), list as NativeFn);
         fns.insert(interner::intern_sym("macroexpand1"), macroexpand1 as NativeFn);
         fns.insert(interner::intern_sym("macroexpand"), macroexpand as NativeFn);
+
+        // Atom functions
+        fns.insert(interner::intern_sym("atom"), atom as NativeFn);
+        fns.insert(interner::intern_sym("deref"), deref as NativeFn);
+        fns.insert(interner::intern_sym("reset!"), reset_bang as NativeFn);
+        fns.insert(interner::intern_sym("swap!"), swap_bang as NativeFn);
+        fns.insert(interner::intern_sym("compare-and-set!"), compare_and_set_bang as NativeFn);
+
+        // STM functions
+        fns.insert(interner::intern_sym("ref"), ref_new as NativeFn);
+        fns.insert(interner::intern_sym("ref-set"), ref_set as NativeFn);
+        fns.insert(interner::intern_sym("alter"), alter as NativeFn);
+
+        // Agent functions
+        fns.insert(interner::intern_sym("agent"), agent as NativeFn);
+        fns.insert(interner::intern_sym("send"), send as NativeFn);
+        fns.insert(interner::intern_sym("send-off"), send as NativeFn); // alias
+        fns.insert(interner::intern_sym("await"), await_agent as NativeFn);
+
+        // Condition system functions
+        fns.insert(interner::intern_sym("make-condition"), make_condition as NativeFn);
+
         Self { fns }
     }
 
@@ -599,6 +625,288 @@ fn macroexpand_all(form: &Value, env: &mut Env) -> Result<Value, Error> {
             })
         }
         other => Ok(other),
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// Atoms
+//===----------------------------------------------------------------------===//
+
+/// `(atom value)` — creates a new atom with the given initial value.
+pub fn atom(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 1 {
+        return Err(Error::RuntimeError(
+            "atom requires exactly one argument: the initial value".to_string(),
+        ));
+    }
+    Ok(Value::Atom {
+        span: synthetic_span!(),
+        value: Arc::new(Atom::new(args[0].clone())),
+    })
+}
+
+/// `(deref ref)` — dereferences an atom, ref, or agent to get its current value.
+pub fn deref(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 1 {
+        return Err(Error::RuntimeError(
+            "deref requires exactly one argument".to_string(),
+        ));
+    }
+    match &args[0] {
+        Value::Atom { value, .. } => Ok(value.deref()),
+        Value::Ref { value, .. } => Ok(value.deref()),
+        Value::Agent { value, .. } => Ok(value.deref()),
+        Value::Var { value, .. } => {
+            if let Some(storage) = &value.value {
+                Ok(storage.read().unwrap().clone())
+            } else {
+                Err(Error::RuntimeError("Var is unbound".to_string()))
+            }
+        }
+        other => Err(type_error("Atom, Ref, Agent, or Var", other)),
+    }
+}
+
+/// `(reset! atom value)` — atomically sets the atom's value to the new value.
+pub fn reset_bang(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 2 {
+        return Err(Error::RuntimeError(
+            "reset! requires exactly two arguments: atom and new value".to_string(),
+        ));
+    }
+    match &args[0] {
+        Value::Atom { value: atom, .. } => Ok(atom.reset(args[1].clone())),
+        other => Err(type_error("Atom", other)),
+    }
+}
+
+/// `(swap! atom f & args)` — atomically updates the atom's value by applying f.
+///
+/// The function receives the current value followed by any additional args,
+/// and returns the new value.
+pub fn swap_bang(args: &[Value], env: &mut Env) -> Result<Value, Error> {
+    if args.len() < 2 {
+        return Err(Error::RuntimeError(
+            "swap! requires at least two arguments: atom and function".to_string(),
+        ));
+    }
+
+    let atom = match &args[0] {
+        Value::Atom { value, .. } => value.clone(),
+        other => return Err(type_error("Atom", other)),
+    };
+
+    let func = &args[1];
+    let extra_args: Vec<Value> = args[2..].to_vec();
+
+    let new_value = atom.swap(|current| {
+        let mut call_args = vec![current.clone()];
+        call_args.extend(extra_args.clone());
+        apply_function(func.clone(), &call_args, &mut env.clone()).unwrap_or(current.clone())
+    });
+
+    Ok(new_value)
+}
+
+/// `(compare-and-set! atom expected new-value)` — atomically sets the atom if current equals expected.
+pub fn compare_and_set_bang(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 3 {
+        return Err(Error::RuntimeError(
+            "compare-and-set! requires exactly three arguments: atom, expected, and new value"
+                .to_string(),
+        ));
+    }
+    match &args[0] {
+        Value::Atom { value: atom, .. } => {
+            let success = atom.compare_and_set(&args[1], args[2].clone());
+            Ok(Value::Bool { span: synthetic_span!(), value: success })
+        }
+        other => Err(type_error("Atom", other)),
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// STM References
+//===----------------------------------------------------------------------===//
+
+/// `(ref value)` — creates a new STM ref with the given initial value.
+pub fn ref_new(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 1 {
+        return Err(Error::RuntimeError(
+            "ref requires exactly one argument: the initial value".to_string(),
+        ));
+    }
+    Ok(Value::Ref {
+        span: synthetic_span!(),
+        value: Arc::new(Ref::new(args[0].clone())),
+    })
+}
+
+/// `(ref-set ref value)` — sets the ref's value within a transaction.
+pub fn ref_set(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 2 {
+        return Err(Error::RuntimeError(
+            "ref-set requires exactly two arguments: ref and new value".to_string(),
+        ));
+    }
+    match &args[0] {
+        Value::Ref { value: r, .. } => r.ref_set(args[1].clone()).map_err(|e| {
+            Error::RuntimeError(e.to_string())
+        }),
+        other => Err(type_error("Ref", other)),
+    }
+}
+
+/// `(alter ref f & args)` — alters the ref's value by applying f within a transaction.
+pub fn alter(args: &[Value], env: &mut Env) -> Result<Value, Error> {
+    if args.len() < 2 {
+        return Err(Error::RuntimeError(
+            "alter requires at least two arguments: ref and function".to_string(),
+        ));
+    }
+
+    let r = match &args[0] {
+        Value::Ref { value, .. } => value.clone(),
+        other => return Err(type_error("Ref", other)),
+    };
+
+    let func = args[1].clone();
+    let extra_args: Vec<Value> = args[2..].to_vec();
+    let mut env_clone = env.clone();
+
+    r.alter(|current| {
+        let mut call_args = vec![current.clone()];
+        call_args.extend(extra_args.clone());
+        apply_function(func.clone(), &call_args, &mut env_clone).unwrap_or(current.clone())
+    })
+    .map_err(|e| Error::RuntimeError(e.to_string()))
+}
+
+//===----------------------------------------------------------------------===//
+// Agents
+//===----------------------------------------------------------------------===//
+
+/// `(agent value)` — creates a new agent with the given initial state.
+pub fn agent(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.len() != 1 {
+        return Err(Error::RuntimeError(
+            "agent requires exactly one argument: the initial state".to_string(),
+        ));
+    }
+    Ok(Value::Agent {
+        span: synthetic_span!(),
+        value: Arc::new(Agent::new(args[0].clone())),
+    })
+}
+
+/// `(send agent f & args)` — sends an action to the agent.
+pub fn send(args: &[Value], env: &mut Env) -> Result<Value, Error> {
+    if args.len() < 2 {
+        return Err(Error::RuntimeError(
+            "send requires at least two arguments: agent and function".to_string(),
+        ));
+    }
+
+    let ag = match &args[0] {
+        Value::Agent { value, .. } => value.clone(),
+        other => return Err(type_error("Agent", other)),
+    };
+
+    let func = args[1].clone();
+    let extra_args: Vec<Value> = args[2..].to_vec();
+    let env_clone = env.clone();
+
+    ag.send(move |current| {
+        let mut call_args = vec![current.clone()];
+        call_args.extend(extra_args);
+        apply_function(func.clone(), &call_args, &mut env_clone.clone())
+            .unwrap_or(current.clone())
+    });
+
+    Ok(args[0].clone())
+}
+
+/// `(await agent & agents)` — waits for all pending actions to complete.
+pub fn await_agent(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.is_empty() {
+        return Err(Error::RuntimeError(
+            "await requires at least one agent".to_string(),
+        ));
+    }
+
+    for arg in args {
+        match arg {
+            Value::Agent { value, .. } => value.await_agent(),
+            other => return Err(type_error("Agent", other)),
+        }
+    }
+
+    Ok(Value::Nil { span: synthetic_span!() })
+}
+
+//===----------------------------------------------------------------------===//
+// Condition System
+//===----------------------------------------------------------------------===//
+
+/// `(make-condition name & data)` — creates a new condition with the given name and data.
+pub fn make_condition(args: &[Value], _env: &mut Env) -> Result<Value, Error> {
+    if args.is_empty() {
+        return Err(Error::RuntimeError(
+            "make-condition requires at least one argument: the condition name".to_string(),
+        ));
+    }
+
+    let name = match &args[0] {
+        Value::Symbol { value, .. } => value.id(),
+        Value::Keyword { value, .. } => {
+            // Convert keyword to symbol
+            let kw_str = interner::kw_to_str(*value);
+            interner::intern_sym(&kw_str)
+        }
+        other => {
+            return Err(type_error("Symbol or Keyword", other));
+        }
+    };
+
+    let data: Vec<Value> = args[1..].to_vec();
+    Ok(Value::Condition {
+        span: synthetic_span!(),
+        value: Arc::new(Condition::new(name, data)),
+    })
+}
+
+//===----------------------------------------------------------------------===//
+// Apply Function Helper
+//===----------------------------------------------------------------------===//
+
+fn apply_function(func: Value, args: &[Value], env: &mut Env) -> Result<Value, Error> {
+    match func {
+        Value::Function { params, body, env: fn_env, .. } => {
+            if params.len() != args.len() {
+                return Err(Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                    error_str: format!(
+                        "Wrong number of arguments. Expected {}, got {}",
+                        params.len(),
+                        args.len()
+                    ),
+                }));
+            }
+
+            let mut binding_pairs = Vec::with_capacity(args.len() * 2);
+            for (param, arg) in params.iter().zip(args.iter()) {
+                binding_pairs.push(param.clone());
+                binding_pairs.push(arg.clone());
+            }
+            let bindings = Arc::new(Vector::from_iter(binding_pairs));
+            let mut scope_env = fn_env.create_child_with_bindings(bindings);
+
+            let evaluator = Evaluator::new();
+            let body_form =
+                make_do_value(&evaluator, body.clone(), synthetic_span!());
+            evaluator.eval(&body_form, &mut scope_env).map_err(|e| e.error)
+        }
+        Value::NativeFunction { f, .. } => f(args, env),
+        other => Err(type_error("Function", &other)),
     }
 }
 

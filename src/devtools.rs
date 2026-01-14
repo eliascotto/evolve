@@ -150,6 +150,21 @@ fn pretty_print_ast_with_indent(value: &Value, indent: usize) -> String {
         Value::NativeFunction { span: _, name: n, f: _ } => {
             write!(result, "NativeFunction:{}", interner::sym_to_str(*n)).unwrap()
         }
+        Value::Atom { value, .. } => {
+            write!(result, "Atom:{}", value.deref()).unwrap()
+        }
+        Value::Ref { value, .. } => {
+            write!(result, "Ref:{}", value.deref()).unwrap()
+        }
+        Value::Agent { value, .. } => {
+            write!(result, "Agent:{}", value.deref()).unwrap()
+        }
+        Value::Condition { value, .. } => {
+            write!(result, "Condition:{}", value.name()).unwrap()
+        }
+        Value::Restart { value, .. } => {
+            write!(result, "Restart:{}", value.name()).unwrap()
+        }
     }
 
     result

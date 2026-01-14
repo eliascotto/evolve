@@ -4,7 +4,7 @@ use crate::collections::{List, Vector};
 use crate::core::native_fns::NativeRegistry;
 use crate::core::{Metadata, Namespace, RecurContext, SpecialFormRegistry, Var};
 use crate::env::Env;
-use crate::error::{Error, SpannedResult, SyntaxError, error_at};
+use crate::error::{Error, SpannedError, SpannedResult, SyntaxError, error_at};
 use crate::interner::{self, SymId};
 use crate::reader::Span;
 use crate::value::Value;
@@ -439,6 +439,36 @@ impl Evaluator {
         }
         if sym == self.special_forms.s_ns {
             return self.eval_ns(args, env, form_span);
+        }
+        // Exception handling
+        if sym == self.special_forms.s_try {
+            return self.eval_try(args, env, form_span);
+        }
+        if sym == self.special_forms.s_throw {
+            return self.eval_throw(args, env, form_span);
+        }
+        // STM
+        if sym == self.special_forms.s_dosync {
+            return self.eval_dosync(args, env, form_span);
+        }
+        // Condition system
+        if sym == self.special_forms.s_handler_bind {
+            return self.eval_handler_bind(args, env, form_span);
+        }
+        if sym == self.special_forms.s_handler_case {
+            return self.eval_handler_case(args, env, form_span);
+        }
+        if sym == self.special_forms.s_restart_case {
+            return self.eval_restart_case(args, env, form_span);
+        }
+        if sym == self.special_forms.s_signal {
+            return self.eval_signal(args, env, form_span);
+        }
+        if sym == self.special_forms.s_error {
+            return self.eval_error(args, env, form_span);
+        }
+        if sym == self.special_forms.s_invoke_restart {
+            return self.eval_invoke_restart(args, env, form_span);
         }
 
         Err(error_at(
@@ -1263,6 +1293,605 @@ impl Evaluator {
         Ok(ns)
     }
 
+    //===----------------------------------------------------------------------===//
+    // Exception Handling
+    //===----------------------------------------------------------------------===//
+
+    /// Evaluate a try/catch/finally form.
+    ///
+    /// Syntax: (try body... (catch type binding body...) ... (finally body...))
+    fn eval_try(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        let mut body_forms: Vec<Value> = Vec::new();
+        let mut catch_clauses: Vec<(SymId, SymId, Vec<Value>)> = Vec::new();
+        let mut finally_body: Option<Vec<Value>> = None;
+
+        for form in args.iter() {
+            match form {
+                Value::List { value: list, .. } => {
+                    if let Some(first) = list.head() {
+                        if first.match_symbol(self.special_forms.s_catch) {
+                            // Parse catch clause: (catch type binding body...)
+                            let tail = list.tail().unwrap_or_else(List::new);
+                            let mut iter = tail.iter();
+
+                            let exception_type = match iter.next() {
+                                Some(Value::Symbol { value: sym, .. }) => sym.id(),
+                                _ => {
+                                    return Err(error_at(
+                                        form.span(),
+                                        Error::SyntaxError(SyntaxError::InvalidDeclaration {
+                                            reason: "catch requires an exception type symbol"
+                                                .to_string(),
+                                        }),
+                                    ));
+                                }
+                            };
+
+                            let binding = match iter.next() {
+                                Some(Value::Symbol { value: sym, .. }) => sym.id(),
+                                _ => {
+                                    return Err(error_at(
+                                        form.span(),
+                                        Error::SyntaxError(SyntaxError::InvalidDeclaration {
+                                            reason: "catch requires a binding symbol".to_string(),
+                                        }),
+                                    ));
+                                }
+                            };
+
+                            let catch_body: Vec<Value> = iter.cloned().collect();
+                            catch_clauses.push((exception_type, binding, catch_body));
+                            continue;
+                        } else if first.match_symbol(self.special_forms.s_finally) {
+                            // Parse finally clause: (finally body...)
+                            let tail = list.tail().unwrap_or_else(List::new);
+                            finally_body = Some(tail.iter().cloned().collect());
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            body_forms.push(form.clone());
+        }
+
+        // Evaluate body forms
+        let body_result: Result<Value, SpannedError> = {
+            let mut result = Value::Nil { span: synthetic_span!() };
+            let mut try_succeeded = true;
+            let mut caught_error: Option<SpannedError> = None;
+
+            for form in &body_forms {
+                match self.eval(form, &mut env) {
+                    Ok(val) => result = val,
+                    Err(e) => {
+                        try_succeeded = false;
+                        caught_error = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if try_succeeded {
+                Ok(result)
+            } else {
+                Err(caught_error.unwrap())
+            }
+        };
+
+        let final_result = match body_result {
+            Ok(val) => val,
+            Err(err) => {
+                // Try to find a matching catch clause
+                let mut handled = false;
+                let mut catch_result = Value::Nil { span: synthetic_span!() };
+
+                for (exception_type, binding, catch_body) in &catch_clauses {
+                    // For now, match any error to any catch clause
+                    // In a more complete implementation, we'd check the exception type
+                    let _ = exception_type; // Allow matching all for simplicity
+
+                    // Create the exception value
+                    let exception_value = Value::String {
+                        span: form_span.clone(),
+                        value: Arc::from(err.error.to_string()),
+                    };
+
+                    // Bind the exception
+                    let catch_env = env.set(*binding, exception_value);
+                    let mut catch_env = catch_env;
+
+                    // Evaluate catch body
+                    for form in catch_body {
+                        match self.eval(form, &mut catch_env) {
+                            Ok(val) => catch_result = val,
+                            Err(e) => {
+                                // Run finally if present and re-throw
+                                if let Some(ref finally) = finally_body {
+                                    for form in finally {
+                                        let _ = self.eval(form, &mut env);
+                                    }
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    handled = true;
+                    break;
+                }
+
+                if !handled {
+                    // Run finally if present and re-throw
+                    if let Some(ref finally) = finally_body {
+                        for form in finally {
+                            let _ = self.eval(form, &mut env);
+                        }
+                    }
+                    return Err(err);
+                }
+
+                catch_result
+            }
+        };
+
+        // Run finally
+        if let Some(ref finally) = finally_body {
+            for form in finally {
+                self.eval(form, &mut env)?;
+            }
+        }
+
+        Ok(Step::Value(final_result, env))
+    }
+
+    /// Evaluate a throw form.
+    ///
+    /// Syntax: (throw exception) or (throw type message)
+    fn eval_throw(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        if args.is_empty() {
+            return Err(error_at(
+                form_span,
+                Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                    error_str: "throw requires at least one argument".to_string(),
+                }),
+            ));
+        }
+
+        let mut iter = args.iter();
+        let first = self.eval(iter.next().unwrap(), &mut env)?;
+
+        // If it's a Condition, throw it
+        if let Value::Condition { value: condition, .. } = &first {
+            return Err(error_at(
+                form_span,
+                Error::RuntimeError(format!(
+                    "Exception: {} {:?}",
+                    condition.name(),
+                    condition.data()
+                )),
+            ));
+        }
+
+        // Otherwise, create a runtime error from the value
+        let message = first.to_string();
+        Err(error_at(form_span, Error::RuntimeError(message)))
+    }
+
+    //===----------------------------------------------------------------------===//
+    // STM
+    //===----------------------------------------------------------------------===//
+
+    /// Evaluate a dosync form.
+    ///
+    /// Syntax: (dosync body...)
+    fn eval_dosync(
+        &self,
+        args: List<Value>,
+        env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        use crate::stm;
+
+        // Collect all refs that might be used
+        // For simplicity, we'll run the transaction and let it handle refs dynamically
+        let body_forms: Vec<Value> = args.iter().cloned().collect();
+
+        // We need to collect refs from the environment
+        // For now, run without ref tracking (simple implementation)
+        let result = stm::dosync(
+            || {
+                let mut result = Value::Nil { span: synthetic_span!() };
+                let mut local_env = env.clone();
+                for form in &body_forms {
+                    match self.eval(form, &mut local_env) {
+                        Ok(val) => result = val,
+                        Err(_) => break,
+                    }
+                }
+                result
+            },
+            &[], // Empty refs for now - a more complete implementation would track refs
+        )
+        .map_err(|e| error_at(form_span.clone(), Error::RuntimeError(e.to_string())))?;
+
+        Ok(Step::Value(result, env))
+    }
+
+    //===----------------------------------------------------------------------===//
+    // Condition System
+    //===----------------------------------------------------------------------===//
+
+    /// Evaluate a handler-bind form.
+    ///
+    /// Syntax: (handler-bind [condition handler ...] body...)
+    fn eval_handler_bind(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        use crate::condition::{self, Handler, HandlerResult};
+
+        let mut iter = args.iter();
+
+        // First argument should be bindings vector
+        let bindings = match iter.next() {
+            Some(Value::Vector { value: vec, .. }) => vec.clone(),
+            _ => {
+                return Err(error_at(
+                    form_span,
+                    Error::SyntaxError(SyntaxError::InvalidDeclaration {
+                        reason: "handler-bind requires a bindings vector".to_string(),
+                    }),
+                ));
+            }
+        };
+
+        // Parse handler bindings
+        let mut handlers = Vec::new();
+        let mut i = 0;
+        while i + 1 < bindings.len() {
+            let condition_type = match bindings.get(i) {
+                Some(Value::Symbol { value: sym, .. }) => sym.id(),
+                Some(Value::Keyword { value: kw, .. }) => {
+                    let kw_str = interner::kw_to_str(*kw);
+                    interner::intern_sym(&kw_str)
+                }
+                _ => {
+                    return Err(error_at(
+                        form_span,
+                        Error::SyntaxError(SyntaxError::InvalidDeclaration {
+                            reason: "handler-bind condition type must be a symbol or keyword"
+                                .to_string(),
+                        }),
+                    ));
+                }
+            };
+
+            let _handler_fn = bindings.get(i + 1).cloned();
+            // For now, create a simple declining handler
+            handlers.push(Handler::new(condition_type, |_| HandlerResult::Decline));
+            i += 2;
+        }
+
+        // Collect body forms
+        let body_forms: Vec<Value> = iter.cloned().collect();
+
+        // Evaluate body with handlers bound
+        condition::push_handlers(handlers);
+        let mut result = Value::Nil { span: synthetic_span!() };
+        let mut error: Option<SpannedError> = None;
+
+        for form in &body_forms {
+            match self.eval(form, &mut env) {
+                Ok(val) => result = val,
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        condition::pop_handlers();
+
+        match error {
+            Some(e) => Err(e),
+            None => Ok(Step::Value(result, env)),
+        }
+    }
+
+    /// Evaluate a handler-case form.
+    ///
+    /// Syntax: (handler-case expr (condition binding body...) ...)
+    fn eval_handler_case(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        let mut iter = args.iter();
+
+        let expr = match iter.next() {
+            Some(e) => e.clone(),
+            None => {
+                return Err(error_at(
+                    form_span,
+                    Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                        error_str: "handler-case requires an expression".to_string(),
+                    }),
+                ));
+            }
+        };
+
+        // Collect catch clauses
+        let mut catch_clauses: Vec<(SymId, SymId, Vec<Value>)> = Vec::new();
+        for clause in iter {
+            if let Value::List { value: list, .. } = clause {
+                let mut clause_iter = list.iter();
+                let condition_type = match clause_iter.next() {
+                    Some(Value::Symbol { value: sym, .. }) => sym.id(),
+                    _ => continue,
+                };
+                let binding = match clause_iter.next() {
+                    Some(Value::Symbol { value: sym, .. }) => sym.id(),
+                    _ => continue,
+                };
+                let body: Vec<Value> = clause_iter.cloned().collect();
+                catch_clauses.push((condition_type, binding, body));
+            }
+        }
+
+        // Try to evaluate the expression
+        match self.eval(&expr, &mut env) {
+            Ok(val) => Ok(Step::Value(val, env)),
+            Err(err) => {
+                // Try to find a matching handler
+                for (_condition_type, binding, body) in &catch_clauses {
+                    let exception_value = Value::String {
+                        span: form_span.clone(),
+                        value: Arc::from(err.error.to_string()),
+                    };
+                    let mut handler_env = env.set(*binding, exception_value);
+
+                    let mut result = Value::Nil { span: synthetic_span!() };
+                    for form in body {
+                        result = self.eval(form, &mut handler_env)?;
+                    }
+                    return Ok(Step::Value(result, env));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Evaluate a restart-case form.
+    ///
+    /// Syntax: (restart-case expr (restart-name [args] body...) ...)
+    fn eval_restart_case(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        use crate::condition::{self, Restart};
+
+        let mut iter = args.iter();
+
+        let expr = match iter.next() {
+            Some(e) => e.clone(),
+            None => {
+                return Err(error_at(
+                    form_span,
+                    Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                        error_str: "restart-case requires an expression".to_string(),
+                    }),
+                ));
+            }
+        };
+
+        // Collect restart definitions
+        let mut restarts = Vec::new();
+        for restart_def in iter {
+            if let Value::List { value: list, .. } = restart_def {
+                let mut def_iter = list.iter();
+                let restart_name = match def_iter.next() {
+                    Some(Value::Symbol { value: sym, .. }) => sym.id(),
+                    _ => continue,
+                };
+
+                // Create a restart that returns nil (simplified)
+                let restart = Arc::new(Restart::new(restart_name, |_args| {
+                    Value::Nil { span: synthetic_span!() }
+                }));
+                restarts.push(restart);
+            }
+        }
+
+        // Evaluate with restarts available
+        condition::push_restarts(restarts);
+        let result = self.eval(&expr, &mut env);
+        condition::pop_restarts();
+
+        match result {
+            Ok(val) => Ok(Step::Value(val, env)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Evaluate a signal form.
+    ///
+    /// Syntax: (signal condition-name & data)
+    fn eval_signal(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        use crate::condition::{self, Condition};
+
+        if args.is_empty() {
+            return Err(error_at(
+                form_span,
+                Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                    error_str: "signal requires a condition name".to_string(),
+                }),
+            ));
+        }
+
+        let mut iter = args.iter();
+        let name_value = self.eval(iter.next().unwrap(), &mut env)?;
+
+        let name = match &name_value {
+            Value::Symbol { value: sym, .. } => sym.id(),
+            Value::Keyword { value: kw, .. } => {
+                let kw_str = interner::kw_to_str(*kw);
+                interner::intern_sym(&kw_str)
+            }
+            Value::Condition { value: cond, .. } => {
+                // If already a condition, signal it directly
+                let result = condition::signal(cond)
+                    .map_err(|e| error_at(form_span.clone(), Error::RuntimeError(e.to_string())))?;
+                return Ok(Step::Value(
+                    result.unwrap_or(Value::Nil { span: synthetic_span!() }),
+                    env,
+                ));
+            }
+            _ => {
+                return Err(error_at(
+                    form_span,
+                    Error::SyntaxError(SyntaxError::InvalidDeclaration {
+                        reason: "signal requires a symbol, keyword, or condition".to_string(),
+                    }),
+                ));
+            }
+        };
+
+        let mut data = Vec::new();
+        for form in iter {
+            data.push(self.eval(form, &mut env)?);
+        }
+
+        let cond = Condition::new(name, data);
+        let result = condition::signal(&cond)
+            .map_err(|e| error_at(form_span.clone(), Error::RuntimeError(e.to_string())))?;
+
+        Ok(Step::Value(
+            result.unwrap_or(Value::Nil { span: synthetic_span!() }),
+            env,
+        ))
+    }
+
+    /// Evaluate an error form.
+    ///
+    /// Syntax: (error condition-name & data)
+    fn eval_error(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        use crate::condition::{self, Condition};
+
+        if args.is_empty() {
+            return Err(error_at(
+                form_span,
+                Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                    error_str: "error requires a condition name".to_string(),
+                }),
+            ));
+        }
+
+        let mut iter = args.iter();
+        let name_value = self.eval(iter.next().unwrap(), &mut env)?;
+
+        let name = match &name_value {
+            Value::Symbol { value: sym, .. } => sym.id(),
+            Value::Keyword { value: kw, .. } => {
+                let kw_str = interner::kw_to_str(*kw);
+                interner::intern_sym(&kw_str)
+            }
+            _ => {
+                return Err(error_at(
+                    form_span,
+                    Error::SyntaxError(SyntaxError::InvalidDeclaration {
+                        reason: "error requires a symbol or keyword".to_string(),
+                    }),
+                ));
+            }
+        };
+
+        let mut data = Vec::new();
+        for form in iter {
+            data.push(self.eval(form, &mut env)?);
+        }
+
+        let cond = Condition::new(name, data);
+        let result = condition::error(&cond)
+            .map_err(|e| error_at(form_span.clone(), Error::RuntimeError(e.to_string())))?;
+
+        Ok(Step::Value(result, env))
+    }
+
+    /// Evaluate an invoke-restart form.
+    ///
+    /// Syntax: (invoke-restart restart-name & args)
+    fn eval_invoke_restart(
+        &self,
+        args: List<Value>,
+        mut env: Env,
+        form_span: Span,
+    ) -> EvalResult<Step> {
+        use crate::condition;
+
+        if args.is_empty() {
+            return Err(error_at(
+                form_span,
+                Error::SyntaxError(SyntaxError::WrongArgumentCount {
+                    error_str: "invoke-restart requires a restart name".to_string(),
+                }),
+            ));
+        }
+
+        let mut iter = args.iter();
+        let name_value = self.eval(iter.next().unwrap(), &mut env)?;
+
+        let name = match &name_value {
+            Value::Symbol { value: sym, .. } => sym.id(),
+            Value::Keyword { value: kw, .. } => {
+                let kw_str = interner::kw_to_str(*kw);
+                interner::intern_sym(&kw_str)
+            }
+            _ => {
+                return Err(error_at(
+                    form_span,
+                    Error::SyntaxError(SyntaxError::InvalidDeclaration {
+                        reason: "invoke-restart requires a symbol or keyword".to_string(),
+                    }),
+                ));
+            }
+        };
+
+        let mut invoke_args = Vec::new();
+        for form in iter {
+            invoke_args.push(self.eval(form, &mut env)?);
+        }
+
+        let result = condition::invoke_restart(name, &invoke_args)
+            .map_err(|e| error_at(form_span.clone(), Error::RuntimeError(e.to_string())))?;
+
+        Ok(Step::Value(result, env))
+    }
+
     pub fn is_special_form(&self, sym: SymId) -> bool {
         sym == self.special_forms.s_def
             || sym == self.special_forms.s_defmacro
@@ -1274,6 +1903,18 @@ impl Evaluator {
             || sym == self.special_forms.s_recur
             || sym == self.special_forms.s_fn
             || sym == self.special_forms.s_ns
+            // Exception handling
+            || sym == self.special_forms.s_try
+            || sym == self.special_forms.s_throw
+            // STM
+            || sym == self.special_forms.s_dosync
+            // Condition system
+            || sym == self.special_forms.s_handler_bind
+            || sym == self.special_forms.s_handler_case
+            || sym == self.special_forms.s_restart_case
+            || sym == self.special_forms.s_signal
+            || sym == self.special_forms.s_error
+            || sym == self.special_forms.s_invoke_restart
     }
 }
 

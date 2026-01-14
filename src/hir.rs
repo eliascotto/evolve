@@ -364,6 +364,37 @@ impl Lowerer {
                     reason: "Cannot lower a namespace value".to_string(),
                 }),
             )),
+            // Runtime values that shouldn't appear in source code
+            Value::Atom { span, .. } => Err(error_at(
+                span.clone(),
+                Error::SyntaxError(SyntaxError::InvalidList {
+                    reason: "Cannot lower an atom value".to_string(),
+                }),
+            )),
+            Value::Ref { span, .. } => Err(error_at(
+                span.clone(),
+                Error::SyntaxError(SyntaxError::InvalidList {
+                    reason: "Cannot lower a ref value".to_string(),
+                }),
+            )),
+            Value::Agent { span, .. } => Err(error_at(
+                span.clone(),
+                Error::SyntaxError(SyntaxError::InvalidList {
+                    reason: "Cannot lower an agent value".to_string(),
+                }),
+            )),
+            Value::Condition { span, .. } => Err(error_at(
+                span.clone(),
+                Error::SyntaxError(SyntaxError::InvalidList {
+                    reason: "Cannot lower a condition value".to_string(),
+                }),
+            )),
+            Value::Restart { span, .. } => Err(error_at(
+                span.clone(),
+                Error::SyntaxError(SyntaxError::InvalidList {
+                    reason: "Cannot lower a restart value".to_string(),
+                }),
+            )),
         }
     }
 
